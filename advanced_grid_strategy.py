@@ -1989,200 +1989,181 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Position data: {self.positions.get(symbol, 'No data')}")
 
     async def start(self):
-        """Start the grid trading strategy"""
-        try:
-            logger.info("Starting grid trading strategy...")
-            
-            # Define symbol mapping first
-            self.symbol_map = {
-                'PF_XBTUSD': 'BTC/USD:USD',
-                'PF_XRPUSD': 'XRP/USD:USD',
-                'PI_ETHUSD': 'ETH/USD:ETH',
-                'PF_DOGEUSD': 'DOGE/USD:USD',
-                'PF_LDOUSD': 'LDO/USD:USD',
-                'PF_ADAUSD': 'ADA/USD:USD',
-                'PF_MATICUSD': 'MATIC/USD:USD',
-                'PF_FILUSD': 'FIL/USD:USD',
-                'PF_APEUSD': 'APE/USD:USD',
-                'PF_GMXUSD': 'GMX/USD:USD',
-                'PF_BATUSD': 'BAT/USD:USD',
-                'PF_XLMUSD': 'XLM/USD:USD',
-                'PF_EOSUSD': 'EOS/USD:USD',
-                'PF_OPUSD': 'OP/USD:USD',
-                'PF_AAVEUSD': 'AAVE/USD:USD',
-                'PF_LINKUSD': 'LINK/USD:USD',
-                'PF_XMRUSD': 'XMR/USD:USD',     # Add XMR mapping
-                'PF_ATOMUSD': 'ATOM/USD:USD',
-                'PF_DOTUSD': 'DOT/USD:USD',
-                'PF_ALGOUSD': 'ALGO/USD:USD',
-                'PF_TRXUSD': 'TRX/USD:USD',
-                'PF_SOLUSD': 'SOL/USD:USD',
-                'PF_AVAXUSD': 'AVAX/USD:USD',
-                'PF_UNIUSD': 'UNI/USD:USD',
-                'PF_SNXUSD': 'SNX/USD:USD',
-                'PF_NEARUSD': 'NEAR/USD:USD',
-                'PF_FTMUSD': 'FTM/USD:USD',
-                'PF_ARBUSD': 'ARB/USD:USD',
-                'PF_COMPUSD': 'COMP/USD:USD',
-                'PF_YFIUSD': 'YFI/USD:USD'
-            }
-            self.reverse_symbol_map = {v: k for k, v in self.symbol_map.items()}
-            
-            # Initialize tracking dictionaries
-            self.positions = {}
-            self.last_grid_check = {}
-            self.active_positions = {}
-            
-            # Get initial balance
-            self.last_balance = await self.get_account_balance()
-            logger.info(f"Initial balance: {self.last_balance}")
-            
-            # Now verify spot positions
-            balance = await self.exchange.fetch_balance()
-            for symbol in self.symbol_map.values():
-                asset = symbol.split('/')[0]
-                spot_balance = float(balance.get(asset, {}).get('free', 0))
+        """Start the grid trading strategy with continuous operation"""
+        while True:  # Outer loop for continuous operation
+            try:
+                logger.info("Starting grid trading strategy...")
                 
-                if spot_balance > 0:
-                    logger.error(f"\n{'='*50}")
-                    logger.error(f"FOUND SPOT POSITION - {symbol}")
-                    logger.error(f"Asset: {asset}")
-                    logger.error(f"Balance: {spot_balance}")
-                    
-                    # Get entry price from recent orders
+                # Initialize symbol mappings
+                self.symbol_map = {
+                    'PF_XBTUSD': 'BTC/USD:USD',
+                    'PF_XRPUSD': 'XRP/USD:USD',
+                    'PI_ETHUSD': 'ETH/USD:ETH',
+                    'PF_DOGEUSD': 'DOGE/USD:USD',
+                    'PF_LDOUSD': 'LDO/USD:USD',
+                    'PF_ADAUSD': 'ADA/USD:USD',
+                    'PF_MATICUSD': 'MATIC/USD:USD',
+                    'PF_FILUSD': 'FIL/USD:USD',
+                    'PF_APEUSD': 'APE/USD:USD',
+                    'PF_GMXUSD': 'GMX/USD:USD',
+                    'PF_BATUSD': 'BAT/USD:USD',
+                    'PF_XLMUSD': 'XLM/USD:USD',
+                    'PF_EOSUSD': 'EOS/USD:USD',
+                    'PF_OPUSD': 'OP/USD:USD',
+                    'PF_AAVEUSD': 'AAVE/USD:USD',
+                    'PF_LINKUSD': 'LINK/USD:USD',
+                    'PF_XMRUSD': 'XMR/USD:USD',
+                    'PF_ATOMUSD': 'ATOM/USD:USD',
+                    'PF_DOTUSD': 'DOT/USD:USD',
+                    'PF_ALGOUSD': 'ALGO/USD:USD',
+                    'PF_TRXUSD': 'TRX/USD:USD',
+                    'PF_SOLUSD': 'SOL/USD:USD',
+                    'PF_AVAXUSD': 'AVAX/USD:USD',
+                    'PF_UNIUSD': 'UNI/USD:USD',
+                    'PF_SNXUSD': 'SNX/USD:USD',
+                    'PF_NEARUSD': 'NEAR/USD:USD',
+                    'PF_FTMUSD': 'FTM/USD:USD',
+                    'PF_ARBUSD': 'ARB/USD:USD',
+                    'PF_COMPUSD': 'COMP/USD:USD',
+                    'PF_YFIUSD': 'YFI/USD:USD'
+                }
+                self.reverse_symbol_map = {v: k for k, v in self.symbol_map.items()}
+                
+                # Initialize tracking dictionaries
+                self.positions = {}
+                self.last_grid_check = {}
+                self.active_positions = {}
+                
+                # Retry loop for exchange connection
+                retry_count = 0
+                while retry_count < 5:
                     try:
-                        orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
-                        buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
-                        entry_price = float(buy_orders[0]['price']) if buy_orders else None
-                    except Exception as e:
-                        logger.error(f"Error getting entry price: {e}")
-                        entry_price = None
-                    
-                    if entry_price:
-                        logger.error(f"Entry Price: ${entry_price}")
-                        # Initialize position tracking
-                        self.positions[symbol] = {
-                            'entry_price': entry_price,
-                            'position_size': spot_balance,
-                            'side': 'buy',
-                            'trailing_stop': None,
-                            'tp1_triggered': False,
-                            'tp2_triggered': False,
-                            'breakeven_triggered': False,
-                            'trailing_active': False,
-                            'is_spot': True,
-                            'stop_buffer': 0.02
-                        }
-                    logger.error(f"{'='*50}\n")
-            
-            # Initialize positions dictionary and last grid check time
-            self.positions = {}
-            self.last_grid_check = {}
-            
-            # Get initial positions
-            positions = await self.verify_actual_positions() or []  # Ensure we get a list
-            logger.info(f"Found {len(positions)} positions on startup")
-            
-            for pos in positions:
-                size = float(pos['info'].get('size', 0))
-                symbol = pos['symbol']
-                if size > 0:
-                    logger.error(f"\n{'='*50}")
-                    logger.error(f"INITIALIZING POSITION - {symbol}")
-                    logger.error(f"Size: {size}")
-                    logger.error(f"Entry: {pos['info']['price']}")
-                    logger.error(f"Side: {pos['info']['side']}")
-                    logger.error(f"{'='*50}\n")
-                    
-                    self.positions[symbol] = {
-                        'entry_price': float(pos['info']['price']),
-                        'position_size': size,
-                        'side': pos['info']['side'],
-                        'trailing_stop': None,  # Will be set in manage_stop_loss
-                        'tp1_triggered': False,
-                        'tp2_triggered': False,
-                        'breakeven_triggered': False,
-                        'trailing_active': False,
-                        'is_spot': True  # Force spot flag
-                    }
-
-            # Get initial balance
-            self.last_balance = await self.get_account_balance()
-            logger.info(f"Initial balance: {self.last_balance}")
-            
-            # Initial position check
-            positions = await self.verify_actual_positions()
-            self.active_positions = {p['symbol']: p for p in positions}
-            
-            # Log initial positions
-            logger.info("Initial Position Check:")
-            for pos in positions:
-                if float(pos['info'].get('size', 0)) != 0:
-                    logger.error(f"\n{'='*50}")
-                    logger.error(f"ACTIVE POSITION FOUND - {pos['symbol']}")
-                    logger.error(f"Size: {pos['info']['size']}")
-                    logger.error(f"Entry: {pos['info']['price']}")
-                    logger.error(f"Side: {pos['info']['side']}")
-                    logger.error(f"{'='*50}\n")
-
-            # Start background market scanner
-            self.market_scan_task = asyncio.create_task(self.background_market_scan())
-            logger.info("Started background market scanner")
-            
-            # Initial high-priority symbols
-            self.active_symbols = ['BTC/USD:USD', 'ETH/USD:ETH', 'SOL/USD:USD']
-            logger.info(f"Starting with initial symbols: {self.active_symbols}")
-            
-            # Main trading loop
-            while True:
-                current_time = time.time()
-                
-                # Get fresh positions data
-                positions = await self.get_open_positions()
-                self.active_positions = {p['symbol']: p for p in positions}
-                
-                # First, monitor existing positions
-                logger.info("\n=== MONITORING ACTIVE POSITIONS ===")
-                active_count = 0
-                for pos in positions:
-                    if float(pos['info'].get('size', 0)) > 0:
-                        active_count += 1
-                        symbol = self.reverse_symbol_map.get(pos['symbol'], pos['symbol'])
-                        logger.info(f"Monitoring active position: {symbol}")
-                        await self.monitor_positions(symbol)
-                
-                if active_count == 0:
-                    logger.info("No active positions to monitor")
-                logger.info("=== FINISHED POSITION MONITORING ===\n")
-                
-                # Then update available symbols and process grid orders
-                await self.update_trading_symbols()
-                for symbol in self.active_symbols:
-                    try:
-                        # Get fresh market data for grid assessment
-                        df = await self.get_historical_data(symbol)
-                        if df is not None:
-                            # Reassess grids every 15 minutes
-                            if current_time - self.last_grid_check.get(symbol, 0) > 900:  # 15 minutes
-                                logger.info(f"Reassessing grids for {symbol}")
-                                await self.reassess_grids(symbol)
-                                self.last_grid_check[symbol] = current_time
-                                continue  # Skip normal grid execution if we just reassessed
+                        # Get initial balance
+                        self.last_balance = await self.get_account_balance()
+                        logger.info(f"Initial balance: {self.last_balance}")
+                        
+                        # Verify spot positions
+                        balance = await self.exchange.fetch_balance()
+                        for symbol in self.symbol_map.values():
+                            asset = symbol.split('/')[0]
+                            spot_balance = float(balance.get(asset, {}).get('free', 0))
                             
-                        await self.execute_grid_orders(symbol)
-                    except Exception as e:
-                        logger.error(f"Error processing symbol {symbol}: {e}")
-                        continue
-                    
-                await asyncio.sleep(5)  # 5-second interval
+                            if spot_balance > 0:
+                                logger.error(f"\n{'='*50}")
+                                logger.error(f"FOUND SPOT POSITION - {symbol}")
+                                logger.error(f"Asset: {asset}")
+                                logger.error(f"Balance: {spot_balance}")
+                                
+                                # Get entry price from recent orders
+                                try:
+                                    orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
+                                    buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
+                                    entry_price = float(buy_orders[0]['price']) if buy_orders else None
+                                except Exception as e:
+                                    logger.error(f"Error getting entry price: {e}")
+                                    entry_price = None
+                                
+                                if entry_price:
+                                    logger.error(f"Entry Price: ${entry_price}")
+                                    # Initialize position tracking
+                                    self.positions[symbol] = {
+                                        'entry_price': entry_price,
+                                        'position_size': spot_balance,
+                                        'side': 'buy',
+                                        'trailing_stop': None,
+                                        'tp1_triggered': False,
+                                        'tp2_triggered': False,
+                                        'breakeven_triggered': False,
+                                        'trailing_active': False,
+                                        'is_spot': True,
+                                        'stop_buffer': 0.02
+                                    }
+                                logger.error(f"{'='*50}\n")
+                        
+                        # Get initial positions
+                        positions = await self.verify_actual_positions() or []
+                        logger.info(f"Found {len(positions)} positions on startup")
+                        
+                        break  # Break retry loop on success
+                    except ccxt.RequestTimeout:
+                        retry_count += 1
+                        logger.warning(f"Timeout connecting to exchange. Retry {retry_count}/5")
+                        await asyncio.sleep(30)
+                        if retry_count == 5:
+                            logger.error("Max retries reached, waiting 5 minutes before restarting")
+                            await asyncio.sleep(300)
+                            continue  # Restart from the beginning
                 
-        except Exception as e:
-            logger.error(f"Strategy error: {e}")
-            raise
-        finally:
-            if hasattr(self, 'market_scan_task'):
-                self.market_scan_task.cancel()
-            await self.exchange.close()
+                # Start background market scanner
+                self.market_scan_task = asyncio.create_task(self.background_market_scan())
+                logger.info("Started background market scanner")
+                
+                # Initial high-priority symbols
+                self.active_symbols = ['BTC/USD:USD', 'ETH/USD:ETH', 'SOL/USD:USD']
+                logger.info(f"Starting with initial symbols: {self.active_symbols}")
+                
+                # Main trading loop
+                while True:
+                    try:
+                        current_time = time.time()
+                        
+                        # Get fresh positions data
+                        positions = await self.get_open_positions()
+                        self.active_positions = {p['symbol']: p for p in positions}
+                        
+                        # Monitor existing positions
+                        logger.info("\n=== MONITORING ACTIVE POSITIONS ===")
+                        active_count = 0
+                        for pos in positions:
+                            if float(pos['info'].get('size', 0)) > 0:
+                                active_count += 1
+                                symbol = self.reverse_symbol_map.get(pos['symbol'], pos['symbol'])
+                                logger.info(f"Monitoring active position: {symbol}")
+                                await self.monitor_positions(symbol)
+                        
+                        if active_count == 0:
+                            logger.info("No active positions to monitor")
+                        logger.info("=== FINISHED POSITION MONITORING ===\n")
+                        
+                        # Update and process trading symbols
+                        await self.update_trading_symbols()
+                        for symbol in self.active_symbols:
+                            try:
+                                df = await self.get_historical_data(symbol)
+                                if df is not None and current_time - self.last_grid_check.get(symbol, 0) > 900:
+                                    logger.info(f"Reassessing grids for {symbol}")
+                                    await self.reassess_grids(symbol)
+                                    self.last_grid_check[symbol] = current_time
+                                    continue
+                                    
+                                await self.execute_grid_orders(symbol)
+                            except Exception as e:
+                                logger.error(f"Error processing symbol {symbol}: {e}")
+                                continue
+                            
+                        await asyncio.sleep(5)  # 5-second interval
+                        
+                    except ccxt.RequestTimeout:
+                        logger.warning("Timeout in main loop, continuing...")
+                        await asyncio.sleep(30)
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error in main loop: {e}")
+                        await asyncio.sleep(30)
+                        continue
+                        
+            except Exception as e:
+                logger.error(f"Strategy error: {e}")
+                logger.error("Restarting strategy in 5 minutes...")
+                await asyncio.sleep(300)
+                continue  # Restart from the beginning
+            finally:
+                if hasattr(self, 'market_scan_task'):
+                    self.market_scan_task.cancel()
+                try:
+                    await self.exchange.close()
+                except:
+                    pass
 
     async def background_market_scan(self):
         """Background task to scan and update available markets"""
