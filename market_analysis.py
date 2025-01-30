@@ -14,27 +14,21 @@ logger = logging.getLogger(__name__)
 
 class MarketAnalyzer:
     def __init__(self):
-        # Initialize Qwen2.5-Math Model with correct padding
+        # Initialize FinBERT Model
         try:
-            logger.info("Loading Qwen2.5-Math model...")
-            self.math_tokenizer = AutoTokenizer.from_pretrained(
-                "Qwen/Qwen2.5-Math-7B", 
-                trust_remote_code=True,
-                padding_side='left'
+            logger.info("Loading FinBERT model...")
+            self.tokenizer = AutoTokenizer.from_pretrained('ProsusAI/finbert')
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                'ProsusAI/finbert',
+                torch_dtype=torch.float16
             )
-            self.math_model = AutoModelForCausalLM.from_pretrained(
-                "Qwen/Qwen2.5-Math-7B",
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True
-            )
-            
-            # Load pre-trained weights for technical analysis
-            self.load_pretrained_weights()
-            logger.info("✅ Qwen2.5-Math model loaded successfully with pre-trained weights")
+            # Move to GPU if available
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model = self.model.to(device)
+            logger.info(f"✅ FinBERT model loaded successfully on {device}")
             
         except Exception as e:
-            logger.error(f"Error loading Qwen2.5-Math model: {e}")
+            logger.error(f"Error loading FinBERT model: {e}")
             raise
         
         self.exchange = None
@@ -70,57 +64,57 @@ class MarketAnalyzer:
         except Exception as e:
             logger.error(f"Error loading pre-trained weights: {e}") 
 
-    async def get_math_prediction(self, data: dict, symbol: str) -> float:
-        """Get prediction from pre-trained math model with caching"""
+    async def get_market_sentiment(self, data: dict, symbol: str) -> float:
+        """Get sentiment prediction from FinBERT model with caching"""
         try:
-            logger.info(f"Starting prediction for {symbol}")
+            logger.info(f"Starting sentiment analysis for {symbol}")
             cache_key = f"{symbol}_{time.time() // self.cache_ttl}"
             
             # Check cache first
             if cache_key in self.analysis_cache:
                 logger.info(f"Cache hit for {symbol}")
                 return self.analysis_cache[cache_key]
-                
-            logger.info(f"Tokenizing input for {symbol}")
-            prompt = f"""
-            Analyze technical indicators for {symbol}:
-            RSI: {data['technical']['indicators']['rsi']}
-            EMA Short: {data['technical']['indicators']['ema_short']}
-            EMA Long: {data['technical']['indicators']['ema_long']}
-            MACD: {data['technical']['indicators']['macd']}
-            BB Width: {data['technical']['indicators']['bb_width']}
-            ATR: {data['technical']['indicators']['atr']}
+            
+            # Generate comprehensive analysis text
+            analysis_text = f"""
+            Technical analysis for {symbol}:
+            RSI is at {data['technical']['indicators']['rsi']:.2f}, indicating {'oversold' if data['technical']['indicators']['rsi'] < 30 else 'overbought' if data['technical']['indicators']['rsi'] > 70 else 'neutral'} conditions.
+            
+            Moving Averages:
+            - EMA Short: {data['technical']['indicators']['ema_short']:.2f}
+            - EMA Long: {data['technical']['indicators']['ema_long']:.2f}
+            - Trend is {'bullish' if data['technical']['indicators']['ema_short'] > data['technical']['indicators']['ema_long'] else 'bearish'}
+            
+            MACD Analysis:
+            - MACD: {data['technical']['indicators']['macd']:.4f}
+            - Showing {'bullish' if data['technical']['indicators']['macd'] > 0 else 'bearish'} momentum
+            
+            Volatility Metrics:
+            - Bollinger Band Width: {data['technical']['indicators']['bb_width']:.4f}
+            - ATR: {data['technical']['indicators']['atr']:.4f}
+            - Volatility is {'high' if data['technical']['indicators']['bb_width'] > 0.5 else 'normal'}
             """
             
             # Run prediction in thread pool
             loop = asyncio.get_event_loop()
-            inputs = self.math_tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+            inputs = self.tokenizer(analysis_text, return_tensors="pt", padding=True, truncation=True)
             
-            logger.info(f"Running model inference for {symbol}")
-            predictions = await loop.run_in_executor(
+            logger.info(f"Running sentiment analysis for {symbol}")
+            outputs = await loop.run_in_executor(
                 self.thread_pool,
-                lambda: self.math_model.generate(
-                    **inputs,
-                    max_new_tokens=128,
-                    do_sample=True,
-                    temperature=0.7,
-                    pad_token_id=self.math_tokenizer.eos_token_id,
-                    num_return_sequences=1
-                )
+                lambda: self.model(**inputs)
             )
-            logger.info(f"Completed inference for {symbol}")
             
-            # Cache the result
-            response = self.math_tokenizer.decode(predictions[0], skip_special_tokens=True)
-            try:
-                probability = float([x for x in response.split() if x.replace('.','').isdigit()][0])
-                probability = max(0.0, min(1.0, probability))
-            except:
-                probability = 0.5
-                
-            self.analysis_cache[cache_key] = probability
-            return probability
+            # Get sentiment probabilities
+            sentiment = torch.nn.functional.softmax(outputs.logits, dim=1)
+            sentiment_scores = sentiment[0].tolist()
+            
+            # Cache and return positive sentiment score
+            positive_score = sentiment_scores[0]  # FinBERT order: positive, negative, neutral
+            self.analysis_cache[cache_key] = positive_score
+            
+            return positive_score
                 
         except Exception as e:
-            logger.error(f"Error in math prediction for {symbol}: {e}")
+            logger.error(f"Error in sentiment analysis for {symbol}: {e}")
             return 0.5 
