@@ -276,7 +276,16 @@ class KrakenAdvancedGridStrategy:
             if active_positions:
                 logger.info("\nActive Positions Summary:")
                 for pos in active_positions:
-                    logger.info(f"{pos['info']['symbol']}: {pos['info']['side']} {pos['info']['size']} @ {pos['info']['price']}")
+                    symbol = pos['info']['symbol']
+                    try:
+                        current_price = await self.get_current_price(symbol)
+                        if current_price:  # Only call manage_stop_loss if we have a valid price
+                            await self.manage_stop_loss(symbol, pos, current_price)
+                            logger.info(f"{symbol}: {pos['info']['side']} {pos['info']['size']} @ {pos['info']['price']}")
+                        else:
+                            logger.error(f"Could not get current price for {symbol}")
+                    except Exception as e:
+                        logger.error(f"Error processing position for {symbol}: {e}")
             else:
                 logger.info("No active positions found")
             
@@ -367,12 +376,17 @@ class KrakenAdvancedGridStrategy:
             return None
 
     async def analyze_market_conditions(self, df: pd.DataFrame, symbol: str) -> Tuple[bool, float]:
-        """Analyze market conditions using technical indicators and fees"""
+        """Analyze market conditions using technical indicators and FinBERT sentiment"""
         try:
-            # Add timeout for entire analysis
-            async with asyncio.timeout(30):  # 30 second timeout
+            # Quick check for active positions first
+            if symbol in self.active_positions:
+                current_price = df.iloc[-1]['close']
+                position = self.active_positions[symbol]
+                await self.manage_stop_loss(symbol, position, current_price)
+            
+            # Continue with regular analysis
+            async with asyncio.timeout(5):
                 tasks = []
-                
                 last_row = df.iloc[-1]
                 technical_data = {
                     'technical': {
@@ -387,10 +401,10 @@ class KrakenAdvancedGridStrategy:
                     }
                 }
                 
-                # Add timeout for AI prediction
+                # Add timeout for sentiment analysis
                 ai_task = asyncio.create_task(
                     asyncio.wait_for(
-                        self.market_analyzer.get_math_prediction(technical_data, symbol),
+                        self.market_analyzer.get_market_sentiment(technical_data, symbol),
                         timeout=15
                     )
                 )
@@ -406,39 +420,33 @@ class KrakenAdvancedGridStrategy:
                     macd_cross = last_row['macd'] > last_row['macd_signal']
                     
                     current_bbw = last_row['bb_width']
-                    bbw_valid = 0.01 <= current_bbw <= 0.05
+                    bbw_valid = current_bbw < 0.5
                     
                     return rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid
-
+                
                 # Run technical analysis in thread pool
                 loop = asyncio.get_event_loop()
                 tech_task = loop.run_in_executor(self.market_analyzer.thread_pool, calculate_signals)
                 tasks.append(tech_task)
                 
                 # Wait for all tasks to complete
-                ai_result, tech_signals = await asyncio.gather(*tasks)
+                sentiment_score, tech_signals = await asyncio.gather(*tasks)
                 
-                # Unpack only used results
+                # Unpack technical signals
                 rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid = tech_signals
-                win_probability = ai_result * 100
                 
-                # Quick fee check (no need for async)
-                fee_impact = self.maker_fee + self.taker_fee
-                fee_signal = fee_impact < 0.005
-                
-                # Calculate final signals
+                # Calculate final signals (using sentiment score directly)
                 signal_strength = (
                     (1 if rsi_signal else 0) +
                     (1 if ema_trend else 0) +
                     (1 if macd_cross else 0) +
                     (1 if bbw_valid else 0) +
-                    (1 if fee_signal else 0)
+                    (sentiment_score)  # Add sentiment as part of signal strength
                 ) / 5.0
                 
-                should_trade = (60 <= win_probability <= 100) and (signal_strength >= 0.5)
+                should_trade = signal_strength >= 0.6  # Adjusted threshold
                 
-                # Log results (minimal logging for speed)
-                logger.info(f"Analysis complete - Win Prob: {win_probability:.1f}%, Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
+                logger.info(f"Analysis complete - Sentiment: {sentiment_score:.2f}, Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
                 
                 return should_trade, current_bbw
                     
@@ -1523,7 +1531,8 @@ class KrakenAdvancedGridStrategy:
                 try:
                     # FORCE spot check first before anything else
                     balance = await self.exchange.fetch_balance()
-                    asset = symbol.split('/')[0]
+                    raw_asset = symbol.split('/')[0].replace(':USD', '')  # Remove :USD suffix
+                    asset = raw_asset
                     spot_balance = float(balance.get(asset, {}).get('free', 0))
                     total_balance = float(balance.get(asset, {}).get('total', 0))
                     is_spot = True  # FORCE SPOT for now
@@ -1536,8 +1545,9 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Is Spot: {is_spot}")
                     logger.info(f"{'='*50}\n")
                     
-                    # Then get entry price
-                    orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
+                    # Then get entry price with correct symbol format
+                    clean_symbol = f"{raw_asset}/USD"  # Use clean symbol format
+                    orders = await self.exchange.fetch_closed_orders(clean_symbol, limit=5)
                     entry_orders = [order for order in orders 
                                   if order['status'] == 'closed' 
                                   and order['side'] == 'buy']
@@ -1632,30 +1642,43 @@ class KrakenAdvancedGridStrategy:
                 logger.error(f"Error calculating profit: {e}")
                 return
 
-            # Add base stop loss check (-10% hard stop)
-            stop_price = entry_price * 0.90  # Fixed -10% stop
-            
-            # Check if we should stop out
-            if current_price <= stop_price:
-                logger.info(f"\n{'='*50}")
-                logger.info(f"🚨 STOP LOSS TRIGGERED for {symbol}")
-                logger.info(f"Entry: ${entry_price:.4f}")
-                logger.info(f"Current: ${current_price:.4f}")
-                logger.info(f"Stop Price: ${stop_price:.4f}")
-                logger.info(f"P&L: {profit_pct:.2f}%")
-                logger.info(f"{'='*50}\n")
+            # Get most recent entry price from order history
+            try:
+                orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
+                recent_buys = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
+                if recent_buys:
+                    entry_price = float(recent_buys[0]['price'])
+                    logger.info(f"Using most recent entry price: ${entry_price}")
                 
-                stop_executed = await self.execute_stop_loss(
-                    symbol=symbol,
-                    position_size=position_size,
-                    is_spot=is_spot,
-                    reason="stop loss"
-                )
+                # Add base stop loss check (-10% from ACTUAL entry)
+                stop_price = entry_price * 0.90  # Fixed -10% stop
                 
-                if stop_executed:
-                    return
-                else:
-                    logger.error(f"Failed to execute stop loss - will retry next cycle")
+                # Check if we should stop out
+                if current_price <= stop_price:
+                    logger.info(f"\n{'='*50}")
+                    logger.info(f"🚨 STOP LOSS CHECK for {symbol}")
+                    logger.info(f"Recent Entry: ${entry_price:.4f}")
+                    logger.info(f"Current: ${current_price:.4f}")
+                    logger.info(f"Stop Price: ${stop_price:.4f}")
+                    logger.info(f"P&L: {profit_pct:.2f}%")
+                    
+                    # Only execute if actually in loss
+                    if current_price < entry_price:
+                        logger.info("Confirming actual loss before stop")
+                        await self.execute_stop_loss(
+                            symbol=symbol,
+                            position_size=position_size,
+                            is_spot=is_spot,
+                            reason="stop loss"
+                        )
+                        return  # Add return here to handle the stop execution
+                    else:
+                        logger.info("Position in profit, skipping stop loss")
+                        return
+                
+            except Exception as e:
+                logger.error(f"Error checking stop loss: {e}")
+                return
 
             # Move stop to breakeven (only if we're in profit)
             if not position_data.get('breakeven_triggered', False) and profit_pct > 0:
@@ -1733,7 +1756,11 @@ class KrakenAdvancedGridStrategy:
                     
                     if tp_executed:
                         position_data['tp1_triggered'] = True
-                        position_data['original_size'] = position_size
+                        if tp_size == position_size:  # If we took full position
+                            position_data['tp2_triggered'] = True  # Skip remaining TPs
+                            position_data['current_position_size'] = 0
+                        else:
+                            position_data['current_position_size'] = position_size * 0.70  # Track remaining 70%
                         logger.info(f"✅ TP1 executed successfully")
                     else:
                         logger.error(f"❌ Failed to execute TP1")
@@ -1751,24 +1778,41 @@ class KrakenAdvancedGridStrategy:
                 logger.info(f"TP Size: {tp_size}")
                 
                 try:
-                    order = await self.exchange.create_market_order(
+                    # Calculate TP2 size (30% of original position)
+                    tp_size = round(position_size * 0.30, 8)  # 30% for TP2
+                    logger.info(f"TP2 Size: {tp_size}")
+                    
+                    # Execute TP2
+                    tp_executed = await self.execute_take_profit(
                         symbol=symbol,
-                        side='sell',  # Always sell for spot
-                        amount=tp_size,
-                        params={'reduceOnly': True} if not is_spot else {}
+                        position_side=position_side,
+                        size=tp_size,
+                        price=current_price,
+                        tp_type="TP2",
+                        is_spot=is_spot
                     )
-                    if order and 'id' in order:
+                    
+                    if tp_executed:
                         position_data['tp2_triggered'] = True
                         position_data['trailing_active'] = True
-                        logger.info(f"TP2 executed: {order['id']}")
+                        if tp_size == position_data['current_position_size']:  # If we took all remaining
+                            position_data['current_position_size'] = 0
+                        else:
+                            position_data['current_position_size'] = position_size * 0.40  # Track remaining 40%
+                        logger.info(f"✅ TP2 executed successfully")
+                    else:
+                        logger.error(f"❌ Failed to execute TP2")
+                        
                 except Exception as e:
                     logger.error(f"Error executing TP2: {e}")
 
-            # Trailing stop logic (only after TP2)
+            # Trailing stop logic (TP3 - final 40%)
             if position_data['tp2_triggered']:
                 try:
                     volatility = await self.get_asset_volatility(symbol)
                     position_data['trailing_active'] = True
+                    remaining_size = position_data['current_position_size']  # Should be 40% of original
+                    logger.info(f"Monitoring trailing stop for remaining {remaining_size} position")
                     
                     # Tighter trailing distances for spot
                     if is_spot:
@@ -1779,7 +1823,7 @@ class KrakenAdvancedGridStrategy:
                         else:
                             trailing_distance = 0.012  # 1.2%
                     else:
-                        # Your existing margin trailing distances
+                        # Margin trailing distances
                         if profit_pct >= 66.0:
                             trailing_distance = min(0.010, max(0.008, volatility * 0.3))
                         elif profit_pct >= 50.0:
@@ -1788,12 +1832,33 @@ class KrakenAdvancedGridStrategy:
                             trailing_distance = min(0.018, max(0.015, volatility * 0.5))
                     
                     new_stop = current_price * (1 - trailing_distance)
+                    
+                    # Update trailing stop if new stop is higher
                     if not position_data.get('trailing_stop') or new_stop > position_data['trailing_stop']:
                         position_data['trailing_stop'] = new_stop
                         logger.info(f"🔄 Updated trailing stop: {new_stop:.4f} - Distance: {trailing_distance*100:.1f}%")
                     
+                    # Check if price hits trailing stop
+                    if current_price <= position_data['trailing_stop']:
+                        logger.info(f"🎯 TP3 (Trailing Stop) TRIGGERED at {profit_pct:.2f}%")
+                        
+                        # Execute final position close
+                        tp_executed = await self.execute_take_profit(
+                            symbol=symbol,
+                            position_side=position_side,
+                            size=remaining_size,  # Close remaining 40%
+                            price=current_price,
+                            tp_type="TP3",
+                            is_spot=is_spot
+                        )
+                        
+                        if tp_executed:
+                            logger.info(f"✅ TP3 (Trailing Stop) executed successfully")
+                            position_data['current_position_size'] = 0
+                            return  # Exit after trailing stop hit
+                    
                 except Exception as e:
-                    logger.error(f"Error updating trailing stop: {e}")
+                    logger.error(f"Error managing trailing stop: {e}")
 
             # Log position status
             logger.info(f"\nPosition Status - {symbol} ({'Spot' if is_spot else 'Margin'}):")
@@ -1923,70 +1988,125 @@ class KrakenAdvancedGridStrategy:
         logger.error(f"❌ Failed to execute {tp_type} after {max_retries} attempts")
         return False
 
-    async def monitor_positions(self, symbol: str) -> None:
-        """Monitor and manage open positions"""
+    async def monitor_positions(self, symbols: List[str] = None) -> None:
+        """Monitor and manage open positions with batch processing"""
         try:
-            # Get mapped symbol from class attribute
-            mapped_symbol = self.symbol_map.get(symbol)
-            logger.info(f"Checking position for {symbol} (mapped: {mapped_symbol})")
+            # If no symbols provided, check all active positions
+            if not symbols:
+                symbols = list(self.active_positions.keys())
             
-            # Check both mapped and original symbol
-            position = None
-            if mapped_symbol in self.active_positions:
-                position = self.active_positions[mapped_symbol]
-                logger.info(f"Found position using mapped symbol: {mapped_symbol}")
-            elif symbol in self.active_positions:
-                position = self.active_positions[symbol]
-                mapped_symbol = symbol
-                logger.info(f"Found position using original symbol: {symbol}")
-                
-            if position:
-                logger.error(f"\n{'='*50}")
-                logger.error(f"MONITORING POSITION - {symbol}")
-                logger.error(f"Size: {position['info'].get('size', 0)}")
-                logger.error(f"Entry: {position['info'].get('price', 'N/A')}")
-                logger.error(f"Side: {position['info'].get('side', 'N/A')}")
-                logger.error(f"{'='*50}\n")
-                
-                # Get current price with proper error handling
-                current_price = await self.get_current_price(symbol)
-                if current_price is None:
-                    logger.error(f"Unable to get current price for {symbol}, skipping position monitoring")
-                    return
-                
-                # Calculate raw P&L first
+            # Create batches of 4 symbols with 8 max workers
+            batch_size = 4  # Balanced batch size
+            max_workers = 8  # More conservative worker count
+            
+            async def process_symbol(symbol: str):
                 try:
-                    entry_price = float(position['info']['price'])
-                    position_side = position['info']['side']
+                    # Get mapped symbol from class attribute
+                    mapped_symbol = self.symbol_map.get(symbol)
+                    logger.info(f"Checking position for {symbol} (mapped: {mapped_symbol})")
                     
-                    raw_pnl_pct = (
-                        ((current_price - entry_price) / entry_price * 100)
-                        if position_side == 'long'
-                        else ((entry_price - current_price) / entry_price * 100)
-                    )
-                    
-                    # Calculate leveraged P&L for display
-                    leveraged_pnl = raw_pnl_pct * self.leverage
-                    
-                    # Log both raw and leveraged P&L
-                    logger.info(f"\nP&L Analysis for {symbol}:")
-                    logger.info(f"Entry: ${entry_price:.4f}")
-                    logger.info(f"Current: ${current_price:.4f}")
-                    logger.info(f"Raw P&L: {raw_pnl_pct:.2f}%")
-                    logger.info(f"Leveraged P&L: {leveraged_pnl:.2f}%")
-                    
-                    # Continue with position management if we have valid prices
-                    await self.manage_stop_loss(symbol, position, current_price)
-                    
+                    # Check both mapped and original symbol
+                    position = None
+                    if mapped_symbol in self.active_positions:
+                        position = self.active_positions[mapped_symbol]
+                        logger.info(f"Found position using mapped symbol: {mapped_symbol}")
+                    elif symbol in self.active_positions:
+                        position = self.active_positions[symbol]
+                        mapped_symbol = symbol
+                        logger.info(f"Found position using original symbol: {symbol}")
+                        
+                    if position:
+                        logger.error(f"\n{'='*50}")
+                        logger.error(f"MONITORING POSITION - {symbol}")
+                        logger.error(f"Size: {position['info'].get('size', 0)}")
+                        logger.error(f"Entry: {position['info'].get('price', 'N/A')}")
+                        logger.error(f"Side: {position['info'].get('side', 'N/A')}")
+                        logger.error(f"{'='*50}\n")
+                        
+                        # Get current price with proper error handling
+                        current_price = await self.get_current_price(symbol)
+                        if current_price is None:
+                            logger.error(f"Unable to get current price for {symbol}, skipping position monitoring")
+                            return
+                        
+                        # Calculate raw P&L first
+                        try:
+                            entry_price = float(position['info']['price'])
+                            position_side = position['info']['side']
+                            position_size = float(position['info'].get('size', 0))
+                            
+                            raw_pnl_pct = (
+                                ((current_price - entry_price) / entry_price * 100)
+                                if position_side == 'long'
+                                else ((entry_price - current_price) / entry_price * 100)
+                            )
+                            
+                            # Calculate leveraged P&L for display
+                            leveraged_pnl = raw_pnl_pct * self.leverage
+                            
+                            # Log both raw and leveraged P&L
+                            logger.info(f"\nP&L Analysis for {symbol}:")
+                            logger.info(f"Entry: ${entry_price:.4f}")
+                            logger.info(f"Current: ${current_price:.4f}")
+                            logger.info(f"Raw P&L: {raw_pnl_pct:.2f}%")
+                            logger.info(f"Leveraged P&L: {leveraged_pnl:.2f}%")
+                            
+                            # QUICK PROFIT CHECK - Do this before manage_stop_loss
+                            if raw_pnl_pct >= 5.0:  # TP1 at 5%
+                                logger.info(f"🎯 Quick TP1 Check Triggered at {raw_pnl_pct:.2f}%")
+                                tp_size = position_size * 0.3
+                                tp_executed = await self.execute_take_profit(
+                                    symbol=symbol,
+                                    position_side=position_side,
+                                    size=tp_size,
+                                    price=current_price,
+                                    tp_type="TP1",
+                                    is_spot=True
+                                )
+                                if tp_executed:
+                                    return
+                            
+                            if raw_pnl_pct >= 10.0:  # TP2 at 10%
+                                logger.info(f"🎯 Quick TP2 Check Triggered at {raw_pnl_pct:.2f}%")
+                                tp_size = position_size * 0.3
+                                tp_executed = await self.execute_take_profit(
+                                    symbol=symbol,
+                                    position_side=position_side,
+                                    size=tp_size,
+                                    price=current_price,
+                                    tp_type="TP2",
+                                    is_spot=True
+                                )
+                                if tp_executed:
+                                    return
+                            
+                            # Continue with regular position management if no TPs executed
+                            await self.manage_stop_loss(symbol, position, current_price)
+                            
+                        except Exception as e:
+                            logger.error(f"Error calculating P&L for {symbol}: {e}")
+                        
+                    else:
+                        logger.info(f"No active position found for {symbol} ({mapped_symbol})")
+                        
                 except Exception as e:
-                    logger.error(f"Error calculating P&L for {symbol}: {e}")
-                
-            else:
-                logger.info(f"No active position found for {symbol} ({mapped_symbol})")
+                    logger.error(f"Error processing symbol {symbol}: {e}")
             
+            # Process symbols in batches with semaphore for max concurrency
+            semaphore = asyncio.Semaphore(max_workers)
+            
+            async def process_with_semaphore(symbol):
+                async with semaphore:
+                    await process_symbol(symbol)
+            
+            # Process batches
+            for i in range(0, len(symbols), batch_size):
+                batch = symbols[i:i + batch_size]
+                tasks = [process_with_semaphore(symbol) for symbol in batch]
+                await asyncio.gather(*tasks)
+                
         except Exception as e:
-            logger.error(f"Error monitoring positions for {symbol}: {e}")
-            logger.error(f"Position data: {self.positions.get(symbol, 'No data')}")
+            logger.error(f"Error in batch position monitoring: {e}")
 
     async def start(self):
         """Start the grid trading strategy with continuous operation"""
@@ -2113,16 +2233,8 @@ class KrakenAdvancedGridStrategy:
                         
                         # Monitor existing positions
                         logger.info("\n=== MONITORING ACTIVE POSITIONS ===")
-                        active_count = 0
-                        for pos in positions:
-                            if float(pos['info'].get('size', 0)) > 0:
-                                active_count += 1
-                                symbol = self.reverse_symbol_map.get(pos['symbol'], pos['symbol'])
-                                logger.info(f"Monitoring active position: {symbol}")
-                                await self.monitor_positions(symbol)
-                        
-                        if active_count == 0:
-                            logger.info("No active positions to monitor")
+                        if self.active_positions:
+                            await self.monitor_positions()  # Will now process all positions in batches
                         logger.info("=== FINISHED POSITION MONITORING ===\n")
                         
                         # Update and process trading symbols
@@ -2918,47 +3030,67 @@ class KrakenAdvancedGridStrategy:
         trend_results = {}
         
         for tf, emas in timeframes.items():
-            df = await self.get_historical_data(symbol, timeframe=tf, limit=210)
-            if df is not None:
-                # Calculate EMAs
-                df[f'ema_{emas["fast_ema"]}'] = df['close'].ewm(span=emas['fast_ema'], adjust=False).mean()
-                df[f'ema_{emas["slow_ema"]}'] = df['close'].ewm(span=emas['slow_ema'], adjust=False).mean()
-                
-                # Add RSI
-                df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
-                
-                # Add MACD
-                macd = ta.trend.MACD(
-                    df['close'], 
-                    window_slow=self.macd_slow, 
-                    window_fast=self.macd_fast, 
-                    window_sign=self.macd_signal
-                )
-                df['macd'] = macd.macd()
-                df['macd_signal'] = macd.macd_signal()
-                df['macd_histogram'] = macd.macd_diff()
-                
-                # Get S/R levels with Fibonacci
-                support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
-                
-                # Get last values
-                fast_ema = df[f'ema_{emas["fast_ema"]}'].iloc[-1]
-                slow_ema = df[f'ema_{emas["slow_ema"]}'].iloc[-1]
-                current_price = df['close'].iloc[-1]
-                
-                # Determine trend
-                trend_results[tf] = {
-                    'trend': 'bullish' if fast_ema > slow_ema else 'bearish',
-                    'strength': abs(fast_ema - slow_ema) / slow_ema * 100,
-                    'rsi': df['rsi'].iloc[-1],
-                    'macd_hist': df['macd_histogram'].iloc[-1],
-                    'is_oversold': df['rsi'].iloc[-1] < 30,
-                    'is_overbought': df['rsi'].iloc[-1] > 70,
-                    'support_levels': support_levels,
-                    'resistance_levels': resistance_levels,
-                    'near_support': any(abs(current_price - s) / s < 0.01 for s in support_levels),
-                    'near_resistance': any(abs(current_price - r) / r < 0.01 for r in resistance_levels)
-                }
+            try:
+                # Add timeout and retry logic for data fetch
+                for attempt in range(3):  # 3 retries
+                    try:
+                        df = await asyncio.wait_for(
+                            self.get_historical_data(symbol, timeframe=tf, limit=210),
+                            timeout=30  # 30 second timeout
+                        )
+                        if df is not None:
+                            break
+                        await asyncio.sleep(1)
+                    except asyncio.TimeoutError:
+                        if attempt == 2:  # Last attempt
+                            logger.error(f"Timeout getting {tf} data for {symbol}")
+                            continue
+                        await asyncio.sleep(2)
+                        
+                if df is not None:
+                    # Calculate EMAs
+                    df[f'ema_{emas["fast_ema"]}'] = df['close'].ewm(span=emas['fast_ema'], adjust=False).mean()
+                    df[f'ema_{emas["slow_ema"]}'] = df['close'].ewm(span=emas['slow_ema'], adjust=False).mean()
+                    
+                    # Add RSI
+                    df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
+                    
+                    # Add MACD
+                    macd = ta.trend.MACD(
+                        df['close'], 
+                        window_slow=self.macd_slow, 
+                        window_fast=self.macd_fast, 
+                        window_sign=self.macd_signal
+                    )
+                    df['macd'] = macd.macd()
+                    df['macd_signal'] = macd.macd_signal()
+                    df['macd_histogram'] = macd.macd_diff()
+                    
+                    # Get S/R levels with Fibonacci
+                    support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
+                    
+                    # Get last values
+                    fast_ema = df[f'ema_{emas["fast_ema"]}'].iloc[-1]
+                    slow_ema = df[f'ema_{emas["slow_ema"]}'].iloc[-1]
+                    current_price = df['close'].iloc[-1]
+                    
+                    # Determine trend
+                    trend_results[tf] = {
+                        'trend': 'bullish' if fast_ema > slow_ema else 'bearish',
+                        'strength': abs(fast_ema - slow_ema) / slow_ema * 100,
+                        'rsi': df['rsi'].iloc[-1],
+                        'macd_hist': df['macd_histogram'].iloc[-1],
+                        'is_oversold': df['rsi'].iloc[-1] < 30,
+                        'is_overbought': df['rsi'].iloc[-1] > 70,
+                        'support_levels': support_levels,
+                        'resistance_levels': resistance_levels,
+                        'near_support': any(abs(current_price - s) / s < 0.01 for s in support_levels),
+                        'near_resistance': any(abs(current_price - r) / r < 0.01 for r in resistance_levels)
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Error analyzing {tf} timeframe for {symbol}: {e}")
+                continue
         
         return trend_results
 
@@ -2995,8 +3127,8 @@ class KrakenAdvancedGridStrategy:
         
         return validated_levels
 
-    async def get_asset_volatility(self, symbol: str) -> float:
-        """Enhanced volatility calculation using both ATR and returns-based methods"""
+    async def get_asset_volatility(self, symbol: str, is_spot: bool = False) -> float:
+        """Enhanced volatility calculation with protective downside focus for spot"""
         try:
             # Get recent OHLCV data (using existing 15m timeframe for consistency)
             ohlcv = await self.exchange.fetch_ohlcv(symbol, '15m', limit=24)
@@ -3004,6 +3136,7 @@ class KrakenAdvancedGridStrategy:
             # Calculate both ATR and returns volatility
             ranges = []
             returns = []
+            downside_returns = []
             
             for i in range(1, len(ohlcv)):
                 # ATR calculation
@@ -3013,19 +3146,35 @@ class KrakenAdvancedGridStrategy:
                 # Returns calculation
                 close_price = ohlcv[i][4]
                 prev_close = ohlcv[i-1][4]
-                returns.append((close_price - prev_close) / prev_close)
+                ret = (close_price - prev_close) / prev_close
+                returns.append(ret)
+                
+                # Track downside returns for spot
+                if is_spot and ret < 0:
+                    downside_returns.append(abs(ret))  # Use absolute value of negative returns
             
             # ATR-based volatility
             atr_volatility = (sum(ranges) / len(ranges) / ohlcv[-1][4]) * 100
             returns_vol = np.std(returns) * np.sqrt(24) * 100  # Adjusted to daily
             
-            # Use weighted average with more weight on ATR
-            volatility = (atr_volatility * 0.6) + (returns_vol * 0.4)
+            if is_spot and downside_returns:
+                # Higher downside volatility = tighter stops to protect profits
+                downside_vol = np.std(downside_returns) * np.sqrt(24) * 100
+                # Inverse relationship: higher downside vol = lower final volatility = tighter stops
+                volatility = atr_volatility / (1 + downside_vol)
+            else:
+                # Regular volatility calculation for non-spot
+                returns_vol = np.std(returns) * np.sqrt(24) * 100
+                volatility = (atr_volatility * 0.6) + (returns_vol * 0.4)
             
-            logger.info(f"Volatility metrics for {symbol}:")
+            logger.info(f"Volatility metrics for {symbol} ({'Spot' if is_spot else 'Margin'}):")
             logger.info(f"ATR-based: {atr_volatility:.2f}%")
-            logger.info(f"Returns-based: {returns_vol:.2f}%")
-            logger.info(f"Using: {volatility:.2f}%")
+            if is_spot:
+                logger.info(f"Downside Vol: {downside_vol:.2f}%")
+                logger.info(f"Final (Tightened): {volatility:.2f}%")
+            else:
+                logger.info(f"Returns Vol: {returns_vol:.2f}%")
+                logger.info(f"Final: {volatility:.2f}%")
             
             return volatility
             
@@ -3573,6 +3722,68 @@ class KrakenAdvancedGridStrategy:
             
         except Exception as e:
             logger.error(f"Error validating entry conditions: {e}")
+            return False
+
+    async def check_all_positions(self) -> None:
+        """Debug helper to check all positions and balances"""
+        try:
+            balance = await self.exchange.fetch_balance()
+            
+            logger.info("\n=== CHECKING ALL SPOT POSITIONS ===")
+            for currency, amount in balance.items():
+                total = float(amount.get('total', 0))
+                free = float(amount.get('free', 0))
+                used = float(amount.get('used', 0))
+                
+                if total > 0:
+                    logger.info(f"\nFound {currency}:")
+                    logger.info(f"Total: {total}")
+                    logger.info(f"Free: {free}")
+                    logger.info(f"Used: {used}")
+                    
+                    # Try to get recent orders for this asset
+                    try:
+                        symbol = f"{currency}/USD"
+                        orders = await self.exchange.fetch_closed_orders(symbol, limit=3)
+                        if orders:
+                            logger.info(f"Recent orders for {symbol}:")
+                            for order in orders:
+                                logger.info(f"Order: {order['side']} {order['amount']} @ {order['price']}")
+                    except Exception as e:
+                        logger.info(f"Could not fetch orders for {currency}: {e}")
+                        
+            logger.info("=" * 50)
+            
+        except Exception as e:
+            logger.error(f"Error checking positions: {e}")
+
+    async def quick_profit_check(self, symbol: str, position: Dict, current_price: float) -> bool:
+        """Fast profit check and TP execution without other overhead"""
+        try:
+            entry_price = float(position['info']['price'])
+            position_side = position['info'].get('side', 'long')
+            position_size = float(position['info'].get('size', 0))
+            is_spot = True  # For now we're forcing spot
+            
+            # Quick profit calc
+            profit_pct = ((current_price - entry_price) / entry_price) * 100
+            
+            # Check TP1 (5%)
+            if profit_pct >= 5.0:
+                tp_size = position_size * 0.3
+                await self.execute_take_profit(symbol, position_side, tp_size, current_price, "TP1", is_spot)
+                return True
+                
+            # Check TP2 (10%)
+            if profit_pct >= 10.0:
+                tp_size = position_size * 0.3
+                await self.execute_take_profit(symbol, position_side, tp_size, current_price, "TP2", is_spot)
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error in quick profit check: {e}")
             return False
 
 if __name__ == "__main__":
