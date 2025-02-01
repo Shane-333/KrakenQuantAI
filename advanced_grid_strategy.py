@@ -378,77 +378,83 @@ class KrakenAdvancedGridStrategy:
     async def analyze_market_conditions(self, df: pd.DataFrame, symbol: str) -> Tuple[bool, float]:
         """Analyze market conditions using technical indicators and FinBERT sentiment"""
         try:
-            # Quick check for active positions first
+            # Check if we have insufficient funds and there's no active position
+            if not self.has_sufficient_funds and symbol not in self.active_positions:
+                return False, 0.0  # Skip analysis for new positions
+                
+            # Quick check for active positions first (always check regardless of funds)
             if symbol in self.active_positions:
                 current_price = df.iloc[-1]['close']
                 position = self.active_positions[symbol]
                 await self.manage_stop_loss(symbol, position, current_price)
             
-            # Continue with regular analysis
-            async with asyncio.timeout(5):
-                tasks = []
-                last_row = df.iloc[-1]
-                technical_data = {
-                    'technical': {
-                        'indicators': {
-                            'rsi': last_row['rsi'],
-                            'ema_short': last_row['ema_short'],
-                            'ema_long': last_row['ema_long'],
-                            'macd': last_row['macd'],
-                            'bb_width': last_row['bb_width'],
-                            'atr': last_row['atr']
+            # Only continue analysis if we have funds or an active position
+            if self.has_sufficient_funds or symbol in self.active_positions:
+                # Rest of existing analysis code...
+                async with asyncio.timeout(15):  # Increased from 5 to 15 seconds
+                    tasks = []
+                    last_row = df.iloc[-1]
+                    technical_data = {
+                        'technical': {
+                            'indicators': {
+                                'rsi': last_row['rsi'],
+                                'ema_short': last_row['ema_short'],
+                                'ema_long': last_row['ema_long'],
+                                'macd': last_row['macd'],
+                                'bb_width': last_row['bb_width'],
+                                'atr': last_row['atr']
+                            }
                         }
                     }
-                }
-                
-                # Add timeout for sentiment analysis
-                ai_task = asyncio.create_task(
-                    asyncio.wait_for(
-                        self.market_analyzer.get_market_sentiment(technical_data, symbol),
-                        timeout=15
+                    
+                    # Add timeout for sentiment analysis
+                    ai_task = asyncio.create_task(
+                        asyncio.wait_for(
+                            self.market_analyzer.get_market_sentiment(technical_data, symbol),
+                            timeout=15
+                        )
                     )
-                )
-                tasks.append(ai_task)
-                
-                # Task 2: Calculate technical signals concurrently
-                def calculate_signals():
-                    rsi = last_row['rsi']
-                    rsi_signal = 30 <= rsi <= 70
+                    tasks.append(ai_task)
                     
-                    ema_trend = last_row['ema_short'] > last_row['ema_long']
+                    # Task 2: Calculate technical signals concurrently
+                    def calculate_signals():
+                        rsi = last_row['rsi']
+                        rsi_signal = 30 <= rsi <= 70
+                        
+                        ema_trend = last_row['ema_short'] > last_row['ema_long']
+                        
+                        macd_cross = last_row['macd'] > last_row['macd_signal']
+                        
+                        current_bbw = last_row['bb_width']
+                        bbw_valid = current_bbw < 0.5
+                        
+                        return rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid
                     
-                    macd_cross = last_row['macd'] > last_row['macd_signal']
+                    # Run technical analysis in thread pool
+                    loop = asyncio.get_event_loop()
+                    tech_task = loop.run_in_executor(self.market_analyzer.thread_pool, calculate_signals)
+                    tasks.append(tech_task)
                     
-                    current_bbw = last_row['bb_width']
-                    bbw_valid = current_bbw < 0.5
+                    # Wait for all tasks to complete
+                    sentiment_score, tech_signals = await asyncio.gather(*tasks)
                     
-                    return rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid
-                
-                # Run technical analysis in thread pool
-                loop = asyncio.get_event_loop()
-                tech_task = loop.run_in_executor(self.market_analyzer.thread_pool, calculate_signals)
-                tasks.append(tech_task)
-                
-                # Wait for all tasks to complete
-                sentiment_score, tech_signals = await asyncio.gather(*tasks)
-                
-                # Unpack technical signals
-                rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid = tech_signals
-                
-                # Calculate final signals (using sentiment score directly)
-                signal_strength = (
-                    (1 if rsi_signal else 0) +
-                    (1 if ema_trend else 0) +
-                    (1 if macd_cross else 0) +
-                    (1 if bbw_valid else 0) +
-                    (sentiment_score)  # Add sentiment as part of signal strength
-                ) / 5.0
-                
-                should_trade = signal_strength >= 0.6  # Adjusted threshold
-                
-                logger.info(f"Analysis complete - Sentiment: {sentiment_score:.2f}, Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
-                
-                return should_trade, current_bbw
+                    # Unpack technical signals
+                    rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid = tech_signals
+                    
+                    # Calculate final signals (using sentiment score directly)
+                    signal_strength = (
+                        (1 if rsi_signal else 0) +
+                        (1 if ema_trend else 0) +
+                        (1 if macd_cross else 0) +
+                        (1 if bbw_valid else 0) +
+                        (sentiment_score)  # Add sentiment as part of signal strength
+                    ) / 5.0
+                    
+                    should_trade = signal_strength >= 0.6  # Adjusted threshold
+                    
+                    logger.info(f"Analysis complete - Sentiment: {sentiment_score:.2f}, Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
+                    
+                    return should_trade, current_bbw
                     
         except asyncio.TimeoutError:
             logger.error(f"Analysis timeout for {symbol}")
@@ -2109,9 +2115,11 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error in batch position monitoring: {e}")
 
     async def start(self):
-        """Start the grid trading strategy with continuous operation"""
-        while True:  # Outer loop for continuous operation
+        while True:  # Add this outer loop
             try:
+                # Add a new flag to track if we have sufficient funds
+                self.has_sufficient_funds = True
+                
                 logger.info("Starting grid trading strategy...")
                 
                 # Initialize symbol mappings
@@ -2213,7 +2221,7 @@ class KrakenAdvancedGridStrategy:
                             logger.error("Max retries reached, waiting 5 minutes before restarting")
                             await asyncio.sleep(300)
                             continue  # Restart from the beginning
-                
+                            
                 # Start background market scanner
                 self.market_scan_task = asyncio.create_task(self.background_market_scan())
                 logger.info("Started background market scanner")
@@ -2259,6 +2267,10 @@ class KrakenAdvancedGridStrategy:
                         logger.warning("Timeout in main loop, continuing...")
                         await asyncio.sleep(30)
                         continue
+                    except ccxt.InsufficientFunds:
+                        logger.warning("Insufficient funds detected - switching to position management only mode")
+                        self.has_sufficient_funds = False
+                        # Continue execution to manage existing positions
                     except Exception as e:
                         logger.error(f"Error in main loop: {e}")
                         await asyncio.sleep(30)
@@ -2282,25 +2294,31 @@ class KrakenAdvancedGridStrategy:
         try:
             while True:
                 logger.info("Running background market scan...")
-            
-                # Update available symbols based on balance
-                balance = await self.get_account_balance()
-            
-                new_symbols = ['BTC/USD:USD', 'ETH/USD:ETH', 'SOL/USD:USD']  # Base tier
-            
-                if balance >= 500:
-                    new_symbols.extend(['ATOM/USD:USD', 'LINK/USD:USD'])
-                if balance >= 2000:
-                    new_symbols.extend(['AAVE/USD:USD', 'UNI/USD:USD'])
-                if balance >= 5000:
-                    new_symbols.extend(['DOT/USD:USD', 'AVAX/USD:USD'])
                 
-                # Update active symbols
-                self.active_symbols = list(set(new_symbols))
-                logger.info(f"Updated active symbols: {self.active_symbols}")
-            
+                # Only scan for new symbols if we have sufficient funds
+                if self.has_sufficient_funds:
+                    # Update available symbols based on balance
+                    available_balance = await self.get_available_balance()
+                    
+                    new_symbols = ['BTC/USD:USD', 'ETH/USD:ETH', 'SOL/USD:USD']  # Base tier
+                    
+                    if available_balance >= 500:
+                        new_symbols.extend(['ATOM/USD:USD', 'LINK/USD:USD'])
+                    if available_balance >= 2000:
+                        new_symbols.extend(['AAVE/USD:USD', 'UNI/USD:USD'])
+                    if available_balance >= 5000:
+                        new_symbols.extend(['DOT/USD:USD', 'AVAX/USD:USD'])
+                        
+                    # Update active symbols
+                    self.active_symbols = list(set(new_symbols))
+                    logger.info(f"Updated active symbols: {self.active_symbols}")
+                else:
+                    # Only track symbols with active positions
+                    self.active_symbols = list(self.active_positions.keys())
+                    logger.info(f"Insufficient funds - Only monitoring active positions: {self.active_symbols}")
+                
                 await asyncio.sleep(3600)  # Scan every hour
-            
+                
         except asyncio.CancelledError:
             logger.info("Background market scanner stopped")
         except Exception as e:
@@ -3265,12 +3283,12 @@ class KrakenAdvancedGridStrategy:
         logger.info(f"🔍 HOURLY SYMBOL SCAN - PRE-FILTERING {len(symbols)} SYMBOLS")
         logger.info(f"{'='*50}")
         
-        # Get account balance first
-        account_balance = await self.get_account_balance()
-        logger.info(f"Account Balance: ${account_balance:.2f}")
+        # Get available balance first
+        available_balance = await self.get_available_balance()  # Changed from get_account_balance
+        logger.info(f"Available Balance: ${available_balance:.2f}")
         
         # Calculate max position size (e.g., 20% of account)
-        max_position_size = account_balance * 0.20
+        max_position_size = available_balance * 0.20
         logger.info(f"Max Position Size: ${max_position_size:.2f}")
         
         # Restricted pairs for US/TX
@@ -3338,7 +3356,7 @@ class KrakenAdvancedGridStrategy:
             self.last_filtered_symbols = filtered
             
             logger.info(f"\n✨ Selected {len(filtered)} symbols within account trading range")
-            logger.info(f"Account size: ${account_balance:.2f}")
+            logger.info(f"Account size: ${available_balance:.2f}")
             logger.info(f"Max position: ${max_position_size:.2f}")
             logger.info("Next scan in 60 minutes")
             return filtered
@@ -3785,6 +3803,34 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.error(f"Error in quick profit check: {e}")
             return False
+
+    async def get_available_balance(self) -> float:
+        """Get actual available balance accounting for open orders"""
+        try:
+            balance = await self.get_account_balance()
+            
+            # Get all open orders to calculate committed funds
+            open_orders = await self.exchange.fetch_open_orders()
+            committed_funds = sum(
+                float(order['price']) * float(order['amount'])
+                for order in open_orders
+                if order['side'] == 'buy'  # Only count buy orders
+            )
+            
+            actual_available = balance - committed_funds
+            logger.info(f"\nBalance Analysis:")
+            logger.info(f"Total Balance: ${balance:.2f}")
+            logger.info(f"Committed in Orders: ${committed_funds:.2f}")
+            logger.info(f"Actually Available: ${actual_available:.2f}")
+            
+            # Update sufficient funds flag
+            self.has_sufficient_funds = actual_available > 20  # Minimum $20 available
+            
+            return actual_available
+            
+        except Exception as e:
+            logger.error(f"Error calculating available balance: {e}")
+            return 0.0
 
 if __name__ == "__main__":
     try:
