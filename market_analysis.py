@@ -75,34 +75,40 @@ class MarketAnalyzer:
                 logger.info(f"Cache hit for {symbol}")
                 return self.analysis_cache[cache_key]
             
-            # Generate comprehensive analysis text
-            analysis_text = f"""
-            Technical analysis for {symbol}:
-            RSI is at {data['technical']['indicators']['rsi']:.2f}, indicating {'oversold' if data['technical']['indicators']['rsi'] < 30 else 'overbought' if data['technical']['indicators']['rsi'] > 70 else 'neutral'} conditions.
-            
-            Moving Averages:
-            - EMA Short: {data['technical']['indicators']['ema_short']:.2f}
-            - EMA Long: {data['technical']['indicators']['ema_long']:.2f}
-            - Trend is {'bullish' if data['technical']['indicators']['ema_short'] > data['technical']['indicators']['ema_long'] else 'bearish'}
-            
-            MACD Analysis:
-            - MACD: {data['technical']['indicators']['macd']:.4f}
-            - Showing {'bullish' if data['technical']['indicators']['macd'] > 0 else 'bearish'} momentum
-            
-            Volatility Metrics:
-            - Bollinger Band Width: {data['technical']['indicators']['bb_width']:.4f}
-            - ATR: {data['technical']['indicators']['atr']:.4f}
-            - Volatility is {'high' if data['technical']['indicators']['bb_width'] > 0.5 else 'normal'}
-            """
+            # Precompute values before string formatting
+            technical_values = {
+                'rsi': data['technical']['indicators']['rsi'],
+                'ema_short': data['technical']['indicators']['ema_short'],
+                'ema_long': data['technical']['indicators']['ema_long'],
+                'macd_value': data['technical']['indicators']['macd'],
+                'bb_width': data['technical']['indicators']['bb_width'],
+                'atr': data['technical']['indicators']['atr']
+            }
+
+            # Use concise f-string formatting
+            analysis_text = (
+                f"Technical analysis for {symbol}: "
+                f"RSI: {technical_values['rsi']:.1f}|"
+                f"EMA Short/Long: {technical_values['ema_short']:.1f}/{technical_values['ema_long']:.1f}|"
+                f"MACD: {technical_values['macd_value']:.3f}|"
+                f"BB Width: {technical_values['bb_width']:.3f}|"
+                f"ATR: {technical_values['atr']:.3f}"
+            )
             
             # Run prediction in thread pool
             loop = asyncio.get_event_loop()
-            inputs = self.tokenizer(analysis_text, return_tensors="pt", padding=True, truncation=True)
+            inputs = self.tokenizer(
+                analysis_text,
+                return_tensors="pt",
+                max_length=128,  # Reduced from default 512
+                truncation=True,
+                padding=False  # Disable padding since we control length
+            )
             
             logger.info(f"Running sentiment analysis for {symbol}")
             outputs = await loop.run_in_executor(
                 self.thread_pool,
-                lambda: self.model(**inputs)
+                lambda: self.model(**inputs, output_attentions=False, output_hidden_states=False)
             )
             
             # Get sentiment probabilities
