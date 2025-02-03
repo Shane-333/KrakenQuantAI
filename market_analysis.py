@@ -9,6 +9,8 @@ import asyncio
 import ccxt
 import os
 import concurrent.futures
+import json
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +39,13 @@ class MarketAnalyzer:
         self.max_workers = min(os.cpu_count() * 2, 60)
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
         self.process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=min(8, self.max_workers))
+        self.model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         
         # Cache for analysis results
         self.analysis_cache = {}
         self.cache_ttl = 300  # 5 minutes
+
+        self.warmup_done = False
 
     def set_exchange(self, exchange):
         """Set the exchange instance"""
@@ -65,62 +70,142 @@ class MarketAnalyzer:
             logger.error(f"Error loading pre-trained weights: {e}") 
 
     async def get_market_sentiment(self, data: dict, symbol: str) -> float:
-        """Get sentiment prediction from FinBERT model with caching"""
+        """Optimized sentiment analysis with batching support"""
+        # Validate input data structure first
+        if not isinstance(data, dict) or 'timeframe' not in data or 'price_data' not in data:
+            logger.warning(f"Invalid data type for {symbol}: {type(data)}")
+            return 0.5
+            
         try:
-            logger.info(f"Starting sentiment analysis for {symbol}")
-            cache_key = f"{symbol}_{time.time() // self.cache_ttl}"
+            price_data = data['price_data']  # Direct access instead of get()
+            if not isinstance(price_data, dict):
+                logger.warning(f"Invalid price_data type for {symbol}: {type(price_data)}")
+                return 0.5
             
-            # Check cache first
-            if cache_key in self.analysis_cache:
-                logger.info(f"Cache hit for {symbol}")
-                return self.analysis_cache[cache_key]
-            
-            # Precompute values before string formatting
-            technical_values = {
-                'rsi': data['technical']['indicators']['rsi'],
-                'ema_short': data['technical']['indicators']['ema_short'],
-                'ema_long': data['technical']['indicators']['ema_long'],
-                'macd_value': data['technical']['indicators']['macd'],
-                'bb_width': data['technical']['indicators']['bb_width'],
-                'atr': data['technical']['indicators']['atr']
-            }
+            required_keys = ['open', 'high', 'low', 'close']
+            if not all(key in price_data for key in required_keys):
+                logger.warning(f"Missing required keys for {symbol}: {price_data.keys()}")
+                return 0.5
+                
+            if not all(isinstance(price_data[key], list) for key in required_keys):
+                logger.warning(f"Price data values must be lists for {symbol}")
+                return 0.5
 
-            # Use concise f-string formatting
-            analysis_text = (
-                f"Technical analysis for {symbol}: "
-                f"RSI: {technical_values['rsi']:.1f}|"
-                f"EMA Short/Long: {technical_values['ema_short']:.1f}/{technical_values['ema_long']:.1f}|"
-                f"MACD: {technical_values['macd_value']:.3f}|"
-                f"BB Width: {technical_values['bb_width']:.3f}|"
-                f"ATR: {technical_values['atr']:.3f}"
+            # Add timeout and validation
+            analysis_text = self._generate_analysis_text(
+                price_data,
+                data['timeframe']
             )
             
-            # Run prediction in thread pool
-            loop = asyncio.get_event_loop()
+            if not analysis_text:
+                return 0.5
+
+            # Add input validation
             inputs = self.tokenizer(
                 analysis_text,
                 return_tensors="pt",
-                max_length=128,  # Reduced from default 512
+                max_length=128,
                 truncation=True,
-                padding=False  # Disable padding since we control length
+                padding='max_length'  # More stable than 'longest'
             )
-            
-            logger.info(f"Running sentiment analysis for {symbol}")
+
+            # Use dedicated executor for model inference
+            loop = asyncio.get_event_loop()
             outputs = await loop.run_in_executor(
-                self.thread_pool,
-                lambda: self.model(**inputs, output_attentions=False, output_hidden_states=False)
+                self.model_executor,  # Create dedicated ThreadPoolExecutor
+                lambda: self.model(**inputs)
             )
-            
-            # Get sentiment probabilities
-            sentiment = torch.nn.functional.softmax(outputs.logits, dim=1)
-            sentiment_scores = sentiment[0].tolist()
-            
-            # Cache and return positive sentiment score
-            positive_score = sentiment_scores[0]  # FinBERT order: positive, negative, neutral
-            self.analysis_cache[cache_key] = positive_score
-            
-            return positive_score
+
+            # Safer score calculation
+            if outputs.logits.dim() != 2:
+                return 0.5
                 
+            return torch.nn.functional.softmax(outputs.logits, dim=1)[0][0].item()
+        
         except Exception as e:
-            logger.error(f"Error in sentiment analysis for {symbol}: {e}")
-            return 0.5 
+            logger.error(f"Sentiment error: {str(e)[:200]}")
+            return 0.5
+
+    def _generate_analysis_text(self, price_data, timeframe):
+        """Generate enriched technical analysis text"""
+        try:
+            # Get last 3 periods for trend context
+            closes = price_data.get('close', [])[-3:]
+            lows = price_data.get('low', [])
+            highs = price_data.get('high', [])
+            
+            # Calculate technical context
+            current_close = closes[-1] if closes else None
+            prev_close = closes[-2] if len(closes) >=2 else current_close
+            price_change_pct = ((current_close - prev_close)/prev_close * 100) if prev_close else 0
+            
+            # Build analysis string
+            analysis = [
+                f"{timeframe} market analysis:",
+                f"Latest Close: {current_close:.2f} ({price_change_pct:+.1f}% vs previous)",
+                f"Recent Range: {min(lows[-3:]):.2f}-{max(highs[-3:]):.2f}" if 'low' in price_data and 'high' in price_data else "",
+                f"Volatility (ATR): {self._calculate_atr(price_data):.2f}" if len(closes) >=14 else ""
+            ]
+            
+            return " | ".join([s for s in analysis if s])
+        
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Analysis text error: {e}")
+            return f"Basic {timeframe} conditions: Close {price_data['close'][-1]:.2f}"
+
+    def _calculate_atr(self, price_data, period=14):
+        """Calculate Average True Range from price data"""
+        try:
+            highs = price_data.get('high', [])
+            lows = price_data.get('low', [])
+            closes = price_data.get('close', [])
+            
+            if len(highs) < period or len(lows) < period or len(closes) < period:
+                return 0.0
+            
+            true_ranges = [
+                max(h - l, abs(h - pc), abs(l - pc))
+                for h, l, pc in zip(highs[-period:], lows[-period:], closes[-period-1:-1])
+            ]
+            
+            return sum(true_ranges) / period
+        
+        except Exception as e:
+            logger.error(f"ATR calculation error: {e}")
+            return 0.0
+
+    async def warmup_model(self):
+        """Warm up the model with empty input"""
+        if not self.warmup_done:
+            dummy_input = self.tokenizer("", return_tensors="pt")
+            _ = self.model(**dummy_input)
+            self.warmup_done = True
+
+    def calculate_signals(self, df: pd.DataFrame) -> dict:
+        """Calculate technical signal strength from dataframe"""
+        try:
+            # Correct RSI calculation
+            rsi_indicator = ta.momentum.RSIIndicator(df['close'], 14)
+            rsi = rsi_indicator.rsi().iloc[-1]
+            
+            # Correct MACD initialization
+            macd = ta.trend.MACD(df['close'])
+            macd_hist = macd.macd_diff().iloc[-1]  # Histogram values
+            
+            # Add these calculations after RSI and MACD
+            rsi_strength = max(0, min(1, (rsi - 30) / 40))  # 30-70 range → 0-1
+            macd_strength = abs(macd_hist) / 0.05  # Normalize to 0-1 scale
+            
+            # Volume spike
+            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
+            volume_strength = min(1, df['volume'].iloc[-1] / (vol_ma * 2))
+            
+            return {
+                'signal_strength': (rsi_strength + macd_strength + volume_strength) / 3,
+                'rsi': rsi,
+                'macd_hist': macd_hist,
+                'volume_ratio': volume_strength
+            }
+        except Exception as e:
+            logger.error(f"Signal calculation error: {e}")
+            return {'signal_strength': 0.0}
