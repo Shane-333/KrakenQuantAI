@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 import ta
 import talib
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 import time
@@ -182,6 +182,7 @@ class KrakenAdvancedGridStrategy:
 
         # Add this line in your __init__
         self.atr_periods = 14  # Standard 14-period ATR
+        self.is_spot = False  # Default to False
 
     def initialize_exchange(self) -> None:
         """Initialize CCXT exchange connection"""
@@ -344,7 +345,7 @@ class KrakenAdvancedGridStrategy:
 
             # Wrap each indicator in try/except
             try:
-                df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
+                df['rsi'] = talib.RSI(df['close'], timeperiod=14)
             except Exception as e:
                 logger.error(f"RSI Error for {symbol}: {e}")
                 df['rsi'] = np.nan
@@ -370,15 +371,15 @@ class KrakenAdvancedGridStrategy:
             
             # Calculate MACD with error handling
             try:
-                macd = ta.trend.MACD(
+                macd_line, signal_line, macd_hist = talib.MACD(
                     df['close'], 
-                    window_slow=self.macd_slow,
-                    window_fast=self.macd_fast,
-                    window_sign=self.macd_signal
+                    fastperiod=self.macd_fast,  # Correct parameter name
+                    slowperiod=self.macd_slow,   # Correct parameter name
+                    signalperiod=self.macd_signal
                 )
-                df['macd'] = macd.macd()
-                df['macd_signal'] = macd.macd_signal()
-                df['macd_histogram'] = macd.macd_diff()
+                df['macd'] = macd_line
+                df['macd_signal'] = signal_line
+                df['macd_histogram'] = macd_hist
             except Exception as e:
                 logger.error(f"MACD Error for {symbol}: {e}")
                 df['macd'] = 0
@@ -1215,9 +1216,11 @@ class KrakenAdvancedGridStrategy:
                                  (price_change < 0 and price_obj < current_price)
 
                 # Adjust validation requirements
-                rsi = ta.RSI(df['close'], 14).iloc[-1]  
-                macd_line, signal_line, _ = ta.MACD(df['close'])
-                histogram = macd_line - signal_line
+                rsi = talib.RSI(df['close'], 14).iloc[-1]  
+                macd_indicator = talib.trend.MACD(df['close'])
+                macd_line = macd_indicator.macd()
+                signal_line = macd_indicator.macd_signal()
+                histogram = macd_indicator.macd_diff()
                 macd_bullish = (
                     (macd_line.iloc[-1] > signal_line.iloc[-1]) and
                     (histogram.iloc[-1] > histogram.iloc[-2]) and
@@ -1277,6 +1280,18 @@ class KrakenAdvancedGridStrategy:
                 # Add size validation before fee check
                 size = await self.validate_grid_order_size(symbol, size)
                 logger.info(f"Validated position size: {size}")
+
+                # Add USD balance check for spot buys
+                if is_spot and side == "buy":
+                    try:
+                        usd_balance = (await self.exchange.fetch_balance())['USD']['free']
+                        order_cost = price * size
+                        if order_cost > usd_balance:
+                            logger.warning(f"❌ Insufficient USD balance: {usd_balance:.2f} < {order_cost:.2f}")
+                            continue
+                    except Exception as e:
+                        logger.error(f"Balance check error: {e}")
+                        continue
                 
                 # Add fee validation
                 if not self.validate_trade_profitability(price, size, symbol):
@@ -1448,159 +1463,32 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error calculating grid levels: {e}")
             return []
 
-    async def calculate_position_size(self, price: float, symbol: str = None) -> float:
-        """Calculate position size with dynamic account scaling and volatility"""
+    async def calculate_position_size(self, current_price: float, symbol: str) -> float:
+        """Safe position sizing with error handling"""
         try:
-            account_value = self.last_balance
-            logger.info(f"\n{'='*50}")
-            logger.info(f"📊 POSITION SIZING FOR {symbol}")
-            logger.info(f"Account Value: ${account_value:.2f}")
-            logger.info(f"Current Price: ${price:.2f}")
-
-            # Initialize volatility
-            volatility = 1.0  # Default value
-            try:
-                volatility = await self.get_asset_volatility(symbol)
-            except Exception as e:
-                logger.warning(f"Using default volatility: {e}")
-
-            # Dynamic allocation based on account size AND number of grid levels
-            grid_levels = 4  # Typical number of grid levels
-            allocation_scale = {
-                (0, 50): 0.25/grid_levels,    # 25% total for micro accounts (<$50)
-                (50, 100): 0.20/grid_levels,  # 20% total for very small accounts
-                (100, 500): 0.15/grid_levels, # 15% total for small accounts
-                (500, 1000): 0.12/grid_levels,# 12% total for medium accounts
-                (1000, float('inf')): 0.10/grid_levels  # 10% total for larger accounts
-            }
-
-            # Find appropriate allocation percentage
-            allocation_percent = 0.05  # Default to 5%
-            for (min_val, max_val), alloc in allocation_scale.items():
-                if min_val <= account_value < max_val:
-                    allocation_percent = alloc
-                    break
-
-            # Get Kraken's minimum requirements
-            try:
-                markets = await self.exchange.fetch_markets()
-                market_info = next((m for m in markets if m['symbol'] == symbol), None)
-                if market_info:
-                    min_amount = float(market_info.get('limits', {}).get('amount', {}).get('min', 0))
-                    min_cost = float(market_info.get('limits', {}).get('cost', {}).get('min', 0))
-                    
-                    logger.info(f"Exchange Minimums:")
-                    logger.info(f"Min Amount: {min_amount}")
-                    logger.info(f"Min Cost: ${min_cost}")
-                else:
-                    raise Exception(f"Market info not found for {symbol}")
-                    
-            except Exception as e:
-                logger.warning(f"Could not fetch market limits: {e}")
-                # Strict fallback minimums based on logs
-                min_requirements = {
-                    'XRP/USD': 2.0,    # From logs: Min Amount: 2.0
-                    'SPX/USD': 3.5,    # From logs: Min Amount: 3.5
-                    'USDT/USD': 5.0,   # From logs: Min Amount: 5.0
-                    'SOL/USD': 0.1,    # Conservative estimate
-                    'BTC/USD': 0.0001, # Standard BTC minimum
-                    'ETH/USD': 0.01,   # Standard ETH minimum
-                    'default': 5.0     # Safe default
-                }
-                min_amount = min_requirements.get(symbol, min_requirements['default'])
-                min_cost = min_amount * price
-
-            # Calculate initial allocation (40% for small accounts)
-            initial_allocation = account_value * allocation_percent
-            position_size = initial_allocation / price
-
-            # CRITICAL: Ensure we meet minimum size requirements
-            position_size = max(position_size, min_amount)
+            if current_price <= 0:
+                logger.error(f"Invalid price {current_price} for {symbol}")
+                return 0.0
+                
+            # Get verified balance (matches line 460-472 fix)
+            balance = await self.exchange.fetch_balance()
+            asset = symbol.split('/')[0]
+            spot_balance = float(balance.get(asset, {}).get('free', 0)) + \
+                           float(balance.get(asset, {}).get('used', 0))
             
-            logger.info(f"Base size before minimums: {position_size:.4f}")
-            logger.info(f"Required minimum: {min_amount:.4f}")
-
-            # Apply volatility scaling if we're above minimums
-            if position_size > min_amount:
-                try:
-                    vol_scale = {
-                        (0, 1): 1.0,      # Very low vol: normal size
-                        (1, 2): 0.9,      # Low vol: slightly reduced
-                        (2, 3): 0.8,      # Moderate vol: reduced
-                        (3, 5): 0.7,      # High vol: significantly reduced
-                        (5, 8): 0.6,      # Very high vol: minimum size
-                        (8, float('inf')): 0.4  # Extreme vol: ultra conservative
-                    }
-                    
-                    vol_factor = 0.4  # Default to most conservative
-                    for (vol_min, vol_max), scale in vol_scale.items():
-                        if vol_min <= volatility < vol_max:
-                            vol_factor = scale
-                            break
-                    
-                    position_size *= vol_factor
-                    position_size = max(position_size, min_amount)  # Ensure we still meet minimums
-                    logger.info(f"Volatility: {volatility:.2f}% (Scale: {vol_factor}x)")
-                    
-                except Exception as e:
-                    logger.warning(f"Using default volatility scaling: {e}")
-
-            # Calculate base position size
-            position_size = initial_allocation / price
+            if spot_balance <= 0:
+                logger.warning(f"No {asset} balance for {symbol}")
+                return 0.0
+                
+            # Risk management (1% of portfolio per trade)
+            portfolio_value = float(balance['total']['USD'])
+            position_size = (portfolio_value * 0.01) / current_price
             
-            # Ensure we meet exchange minimums
-            min_required = max(
-                min_amount,
-                min_cost / price if min_cost else 0
-            )
-            position_size = max(position_size, min_required)
+            logger.info(f"Position size calc: {portfolio_value=}, {current_price=}, {position_size=}")
+            return round(position_size, 4)
             
-            logger.info(f"Base size: {position_size:.4f}")
-            logger.info(f"Min required: {min_required:.4f}")
-
-            # Keep your existing entry scaling logic
-            if not hasattr(self, 'entry_counts'):
-                self.entry_counts = {}
-            entry_count = self.entry_counts.get(symbol, 0) + 1
-            self.entry_counts[symbol] = entry_count
-
-            # Enhanced scaling based on volatility
-            if entry_count <= 3:
-                if volatility <= 3:
-                    base_scale = {1: 1.0, 2: 1.5, 3: 2.0}.get(entry_count, 1.0)
-                elif volatility <= 5:
-                    base_scale = {1: 1.0, 2: 1.3, 3: 1.6}.get(entry_count, 1.0)
-                else:
-                    base_scale = {1: 1.0, 2: 1.2, 3: 1.4}.get(entry_count, 1.0)
-            
-                position_size *= base_scale
-                logger.info(f"Entry scaling: {base_scale}x (Entry #{entry_count})")
-
-            # Final rounding based on price range
-            if price >= 20000:  # BTC
-                position_size = round(position_size, 3)
-            elif price >= 1000:  # ETH
-                position_size = round(position_size, 2)
-            else:
-                position_size = round(position_size, 1)
-
-            # Final validation
-            position_value = position_size * price
-            if position_value > account_value * 0.40:  # Cap at 40% of account
-                position_size = (account_value * 0.40) / price
-                position_size = max(position_size, min_amount)  # Still ensure minimum
-                logger.warning("Position size reduced to stay within 40% account limit")
-
-            logger.info(f"\nFinal Position Details:")
-            logger.info(f"Size: {position_size:.4f}")
-            logger.info(f"Value: ${position_size * price:.2f}")
-            logger.info(f"Account %: {(position_size * price / account_value)*100:.1f}%")
-            logger.info(f"{'='*50}\n")
-
-            return position_size
-
         except Exception as e:
-            logger.error(f"Error calculating position size: {e}")
+            logger.error(f"Position size error: {e}")
             return 0.0
 
     async def manage_stop_loss(self, symbol: str, position: Dict, current_price: float) -> None:
@@ -1964,7 +1852,8 @@ class KrakenAdvancedGridStrategy:
                 try:
                     balance = await self.exchange.fetch_balance()
                     asset = symbol.split('/')[0]
-                    spot_balance = float(balance.get(asset, {}).get('free', 0))
+                    spot_balance = float(balance.get(asset, {}).get('free', 0)) + \
+                                   float(balance.get(asset, {}).get('used', 0))
                     is_spot = spot_balance > 0  # Override is_spot based on actual balance
                     logger.info(f"\nVerified {asset} spot balance: {spot_balance}")
                 except Exception as e:
@@ -2339,52 +2228,59 @@ class KrakenAdvancedGridStrategy:
                     pass
 
     async def background_market_scan(self):
-        """Background task to scan and update available markets"""
+        """Enhanced scanner that finds candidates for filtering"""
         try:
-            while True:
-                logger.info("Running background market scan...")
-                
-                # Only scan for new symbols if we have sufficient funds
-                if self.has_sufficient_funds:
-                    # Update available symbols based on balance
-                    available_balance = await self.get_available_balance()
-                    
-                    new_symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD']  # Base tier
-                    
-                    # Add stablecoin blacklist filtering
-                    stable_blacklist = {'EUR/USD', 'USDC/USD', 'USDT/USD'}
-                    new_symbols = [s for s in new_symbols if s not in stable_blacklist]
-                    
-                    if available_balance >= 500:
-                        new_symbols.extend([
-                            s for s in ['ATOM/USD', 'LINK/USD'] 
-                            if s not in stable_blacklist
-                        ])
-                    if available_balance >= 2000:
-                        new_symbols.extend([
-                            s for s in ['AAVE/USD', 'UNI/USD'] 
-                            if s not in stable_blacklist
-                        ])
-                    if available_balance >= 5000:
-                        new_symbols.extend([
-                            s for s in ['DOT/USD', 'AVAX/USD'] 
-                            if s not in stable_blacklist
-                        ])
-                        
-                    # Update active symbols
-                    self.active_symbols = list(set(new_symbols))
-                    logger.info(f"Updated active symbols: {self.active_symbols}")
-                else:
-                    # Only track symbols with active positions
-                    self.active_symbols = list(self.active_positions.keys())
-                    logger.info(f"Insufficient funds - Only monitoring active positions: {self.active_symbols}")
-                
-                await asyncio.sleep(3600)  # Scan every hour
-                
+            # Get all available symbols from exchange
+            all_markets = await self.exchange.fetch_markets()
+            all_symbols = [m['symbol'] for m in all_markets if m['active']]
+            
+            # Scan for symbols meeting basic conditions
+            scan_tasks = [
+                self._scan_symbol(sym) 
+                for sym in all_symbols[:50]  # Scan top 50 by default
+            ]
+            candidates = await asyncio.gather(*scan_tasks)
+            valid_candidates = [sym for sym in candidates if sym]
+            
+            # Pass candidates through full filtering
+            self.active_symbols = await self.filter_symbols(valid_candidates)
+            
+            logger.info(f"Updated trading symbols: {self.active_symbols}")
+
         except asyncio.CancelledError:
             logger.info("Background market scanner stopped")
         except Exception as e:
             logger.error(f"Error in background market scanner: {e}")
+
+    async def _scan_symbol(self, symbol: str) -> Union[str, None]:
+        """Market scanner pre-filter using analyzer conditions"""
+        try:
+            # Add USD pair check
+            if not symbol.upper().endswith('/USD'):
+                logger.debug(f"Skipping non-USD pair: {symbol}")
+                return None
+                
+            # Get recent data for analysis
+            df = await self.get_historical_data(symbol, '4h', 50)
+            if df is None or len(df) < 20:
+                return None
+                
+            # Check analyzer conditions
+            if not self.market_analyzer.check_volatility(df):
+                return None
+                
+            if not self.market_analyzer.check_trend_strength(df):
+                return None
+                
+            if (datetime.now() - pd.to_datetime(df.index[-1])).seconds > 3600:
+                logger.warning(f"Stale data for {symbol}")
+                return None
+                
+            return symbol
+                
+        except Exception as e:
+            logger.error(f"Scan failed for {symbol}: {e}")
+            return None
 
     async def verify_stop_orders(self, symbol: str, position: dict) -> None:
         try:
@@ -2544,13 +2440,19 @@ class KrakenAdvancedGridStrategy:
                     tf_df['ema200'] = talib.EMA(tf_df['close'], timeperiod=200)
                     
                     # RSI
-                    tf_df['rsi'] = ta.momentum.RSIIndicator(tf_df['close'], window=14).rsi()
+                    tf_df['rsi'] = talib.RSI(tf_df['close'], timeperiod=14)
                     
+
                     # MACD
-                    macd = ta.trend.MACD(tf_df['close'])
-                    tf_df['macd'] = macd.macd()
-                    tf_df['macd_signal'] = macd.macd_signal()
-                    tf_df['macd_hist'] = macd.macd_diff()
+                    macd_line, signal_line, macd_hist = talib.MACD(
+                        tf_df['close'], 
+                        fastperiod=self.macd_fast,  # Correct parameter name
+                        slowperiod=self.macd_slow,   # Correct parameter name
+                        signalperiod=self.macd_signal
+                    )
+                    tf_df['macd'] = macd_line
+                    tf_df['macd_signal'] = signal_line
+                    tf_df['macd_hist'] = macd_hist
                     
                     tech_scores[tf] = {
                         'rsi': tf_df['rsi'].iloc[-1],
@@ -3134,18 +3036,19 @@ class KrakenAdvancedGridStrategy:
                     df[f'ema_{emas["slow_ema"]}'] = df['close'].ewm(span=emas['slow_ema'], adjust=False).mean()
                     
                     # Add RSI
-                    df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
+                    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
                     
+
                     # Add MACD
-                    macd = ta.trend.MACD(
+                    macd_line, signal_line, macd_hist = talib.MACD(
                         df['close'], 
-                        window_slow=self.macd_slow, 
-                        window_fast=self.macd_fast, 
-                        window_sign=self.macd_signal
+                        fastperiod=self.macd_fast, 
+                        slowperiod=self.macd_slow,   
+                        signalperiod=self.macd_signal
                     )
-                    df['macd'] = macd.macd()
-                    df['macd_signal'] = macd.macd_signal()
-                    df['macd_histogram'] = macd.macd_diff()
+                    df['macd'] = macd_line
+                    df['macd_signal'] = signal_line
+                    df['macd_histogram'] = macd_hist
                     
                     # Get S/R levels with Fibonacci
                     support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
@@ -3346,14 +3249,16 @@ class KrakenAdvancedGridStrategy:
             ]
             results = await asyncio.gather(*analysis_tasks)
             
-            # Stage 3: Scoring and sorting
-            valid_symbols = sorted(
-                ((sym, score) for sym, score in results if score >= 8.0),
+            # Stage 3: Scoring and sorting with dynamic threshold
+            sorted_symbols = sorted(
+                [(sym, score) for sym, score in results if score is not None],
                 key=lambda x: x[1],
                 reverse=True
             )
             
-            return [sym for sym, _ in valid_symbols[:10]]  # Top 10 scored
+            # Get top 10% or minimum 3 symbols
+            top_count = max(3, int(len(sorted_symbols) * 0.1))
+            return [sym for sym, _ in sorted_symbols[:top_count]]
         
         except Exception as e:
             logger.error(f"Filter error: {e}")
@@ -3416,9 +3321,9 @@ class KrakenAdvancedGridStrategy:
                 return False
 
             # Calculate position size first
-            position_size = await self.calculate_position_size(symbol)
-            if not position_size:
-                logger.error("Position sizing validation failed")
+            size = await self.calculate_position_size(symbol)
+            if size <= 0:
+                logger.warning(f"Skipping {symbol} - invalid size")
                 return False
 
             # Batch load multi-timeframe data with validation
@@ -3553,7 +3458,7 @@ class KrakenAdvancedGridStrategy:
             current_price = float(df['close'].iloc[-1])
             
             # Add 200 EMA trend check
-            ema200 = ta.EMA(df['close'], 200).iloc[-1]
+            ema200 = talib.EMA(df['close'], 200).iloc[-1]
             price_above_ema200 = current_price > ema200
             
             # Determine market state (matches line 3507-3515)
@@ -3563,10 +3468,11 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"Market State: {market_state.upper()} | Price vs 200 EMA: {'✅ Above' if price_above_ema200 else '❌ Below'}")
             
             # New reversal indicators
-            rsi = ta.RSI(df['close'], 14).iloc[-1]
-            rsi_prev = ta.RSI(df['close'], 14).iloc[-2]
-            macd_line, signal_line, _ = ta.MACD(df['close'])
+            rsi = talib.RSI(df['close'], 14).iloc[-1]
+            rsi_prev = talib.RSI(df['close'], 14).iloc[-2]
+            macd_line, signal_line, _ = talib.MACD(df['close'])
             
+
             # Dynamic criteria based on market state
             rsi_threshold = 30 if market_state == "bull" else 25
             volume_multiplier = 1.25 if market_state == "bull" else 1.1
@@ -3581,10 +3487,11 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"MACD Bull Cross: {'✅' if macd_bullish else '❌'}")
 
             # ATR validation with market-based ranges
-            atr = ta.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
             atr_pct = (atr / current_price) * 100
             atr_min, atr_max = (2.0, 4.0) if market_state == "bear" else (1.5, 5.0)
             
+
             logger.info(f"Daily ATR: {atr_pct:.1f}%")
             
             if not (atr_min <= atr_pct <= atr_max):
@@ -3614,64 +3521,58 @@ class KrakenAdvancedGridStrategy:
 
     def _ema_bullish_cross(self, df: pd.DataFrame) -> bool:
         """Existing EMA cross check from line 3447-3466"""
-        df['ema9'] = ta.EMA(df['close'], timeperiod=9)
-        df['ema21'] = ta.EMA(df['close'], timeperiod=21)
+        df['ema9'] = talib.EMA(df['close'], timeperiod=9)
+        df['ema21'] = talib.EMA(df['close'], timeperiod=21)
         current_cross = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
         previous_cross = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
         return current_cross and previous_cross
 
+
     async def _analyze_4h(self, df: pd.DataFrame, symbol: str) -> bool:
-        """4-hour trend analysis for 15min trading strategy"""
+        """4-hour trend analysis - Relaxed Version"""
         try:
-            # EMA Structure
-            df['ema9'] = ta.EMA(df['close'], 9)
-            df['ema21'] = ta.EMA(df['close'], 21)
-            df['ema200'] = ta.EMA(df['close'], 200)
+            # Simplified EMA Structure
+            df['ema9'] = talib.EMA(df['close'], 9)
             
-            # Price Relationships
+            # Price Relationships (keep basic trend check)
             price_above_ema9 = df['close'].iloc[-1] > df['ema9'].iloc[-1]
-            ema9_above_ema21 = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
-            ema21_above_ema200 = df['ema21'].iloc[-1] > df['ema200'].iloc[-1]
             
-            # Momentum Indicators
-            macd_line, signal_line, _ = ta.MACD(df['close'])
+            # Momentum Indicators (keep core requirements)
+            macd_line, signal_line, _ = talib.MACD(df['close'])
             histogram = macd_line - signal_line
+
             macd_bullish = (
                 (macd_line.iloc[-1] > signal_line.iloc[-1]) and
-                (histogram.iloc[-1] > histogram.iloc[-2]) and
-                (macd_line.iloc[-1] > 0)
+                (histogram.iloc[-1] > histogram.iloc[-2])
             )
             
-            rsi = ta.RSI(df['close'], 14).iloc[-1]
-            rsi_above_50 = rsi > 50
+            rsi = talib.RSI(df['close'], 14).iloc[-1]
+            rsi_above_45 = rsi > 45  # Relaxed from 50
             
-            # Volatility Check (aligned with line 3691-3698)
+            # Volatility Check (keep existing)
             current_price = df['close'].iloc[-1]
-            atr = ta.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            atr_pct = (atr / current_price) * 100
-            valid_atr = 1.0 <= atr_pct <= 3.5  # Tighter range for 15min strategy
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            valid_atr = 1.0 <= (atr/current_price)*100 <= 3.5
             
-            # Volume Validation (matches line 3682-3685)
+            # Volume Validation (relaxed multiplier)
             volume = df['volume'].iloc[-1]
             vol_ma = df['volume'].rolling(20).mean().iloc[-1]
-            strong_volume = volume > vol_ma * 1.2
+            strong_volume = volume > vol_ma * 1.1  # Reduced from 1.2
             
-            # Support/Resistance Check (using 15m levels from line 830-833)
+            # Support Check (wider threshold)
             support_levels, _ = await self.calculate_support_resistance(df, symbol)
-            near_support = any(abs(current_price - s)/s < 0.01 for s in support_levels[:3])
+            near_support = any(abs(current_price - s)/s < 0.015 for s in support_levels[:3])
             
             logger.info(f"\n4H Analysis for {symbol}:")
-            logger.info(f"EMA Alignment: 9>{21}>{200} | {'✅' if all([ema9_above_ema21, ema21_above_ema200]) else '❌'}")
+            logger.info(f"Price > EMA9: {'✅' if price_above_ema9 else '❌'}") 
             logger.info(f"MACD Bullish: {'✅' if macd_bullish else '❌'} | RSI: {rsi:.1f}")
-            logger.info(f"ATR: {atr_pct:.1f}% | Volume: {'✅' if strong_volume else '❌'}")
+            logger.info(f"ATR: {(atr/current_price)*100:.1f}% | Volume: {'✅' if strong_volume else '❌'}")
             logger.info(f"Near Support: {'✅' if near_support else '❌'}")
 
             return all([
                 price_above_ema9,
-                ema9_above_ema21,
-                ema21_above_ema200,
                 macd_bullish,
-                rsi_above_50,  # Keep existing condition
+                rsi_above_45,
                 valid_atr,
                 strong_volume,
                 near_support
@@ -3682,19 +3583,17 @@ class KrakenAdvancedGridStrategy:
             return False
 
     async def _analyze_1h(self, df: pd.DataFrame, symbol: str) -> bool:
-        """1-hour trend confirmation for 15min entries"""
+        """1-hour trend confirmation for 15min entries - Relaxed Version"""
         try:
-            # EMA Structure
-            df['ema9'] = ta.EMA(df['close'], 9)
-            df['ema21'] = ta.EMA(df['close'], 21)
+            # Keep EMA calculations for reference but remove cross requirement
+            df['ema9'] = talib.EMA(df['close'], 9)
+            df['ema21'] = talib.EMA(df['close'], 21)
             
-            # Price Relationships
+            # Simplified price relationship check
             price_above_ema9 = df['close'].iloc[-1] > df['ema9'].iloc[-1]
-            ema9_above_ema21 = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
-            recent_cross = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]  # Recent bullish crossover
             
-            # Momentum Check
-            macd_line, signal_line, _ = ta.MACD(df['close'])
+            # Momentum Check (keep existing)
+            macd_line, signal_line, _ = talib.MACD(df['close'])
             histogram = macd_line - signal_line
             macd_bullish = (
                 (macd_line.iloc[-1] > signal_line.iloc[-1]) and
@@ -3702,39 +3601,28 @@ class KrakenAdvancedGridStrategy:
                 (macd_line.iloc[-1] > 0)
             )
             
-            # Volatility Filter
+            # Keep other existing checks
             current_price = df['close'].iloc[-1]
-            atr = ta.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            atr_pct = (atr / current_price) * 100
-            valid_atr = 1.0 <= atr_pct <= 3.0  # Tighter than 4H
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            valid_atr = 1.0 <= (atr/current_price)*100 <= 3.0
             
-            # Volume Validation
             volume = df['volume'].iloc[-1]
             vol_ma = df['volume'].rolling(20).mean().iloc[-1]
-            strong_volume = volume > vol_ma * 1.15  # Less strict than 4H
+            strong_volume = volume > vol_ma * 1.15
             
-            # Support Alignment
             support_levels, _ = await self.calculate_support_resistance(df, symbol)
-            near_support = any(abs(current_price - s)/s < 0.008 for s in support_levels[:3])  # 0.8% threshold
+            near_support = any(abs(current_price - s)/s < 0.008 for s in support_levels[:3])
             
+            # Updated logging
             logger.info(f"\n1H Analysis for {symbol}:")
-            logger.info(f"EMA9 > EMA21: {'✅' if ema9_above_ema21 else '❌'} | Recent Cross: {'✅' if recent_cross else '❌'}")
-            logger.info(f"MACD Bullish: {'✅' if macd_bullish else '❌'} | ATR: {atr_pct:.1f}%")
+            logger.info(f"Price > EMA9: {'✅' if price_above_ema9 else '❌'}")
+            logger.info(f"MACD Bullish: {'✅' if macd_bullish else '❌'} | ATR: {(atr/current_price)*100:.1f}%")
             logger.info(f"Volume: {'✅' if strong_volume else '❌'} | Near Support: {'✅' if near_support else '❌'}")
 
-            # Add to existing 1H checks:
-            macd_line, signal_line, _ = ta.MACD(df['close'])
-            macd_rising = macd_line.iloc[-1] > macd_line.iloc[-2]  # New condition
-            rsi = ta.RSI(df['close'], 14).iloc[-1]
-            rsi_above_45 = rsi > 45  # More flexible than 5M
-
+            # Simplified return conditions
             return all([
-                price_above_ema9,
-                ema9_above_ema21,
-                recent_cross,
+                price_above_ema9,  # Basic trend alignment
                 macd_bullish,
-                macd_rising,  # New
-                rsi_above_45,  # New
                 valid_atr,
                 strong_volume,
                 near_support
@@ -3748,16 +3636,22 @@ class KrakenAdvancedGridStrategy:
         """5-minute analysis with reversal confirmation"""
         try:
             # EMA Structure
-            df['ema9'] = ta.EMA(df['close'], 9)
-            df['ema21'] = ta.EMA(df['close'], 21)
+            df['ema9'] = talib.EMA(df['close'], 9)
+            df['ema21'] = talib.EMA(df['close'], 21)
             
+
             # Immediate trend requirements
             current_above = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
             prev_below = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
             ema_bullish = current_above and prev_below
             
             # Momentum confirmation with enhanced MACD check
-            macd_line, signal_line, _ = ta.MACD(df['close'])
+            macd_line, signal_line, _ = talib.MACD(
+                df['close'],
+                fastperiod=self.macd_fast,
+                slowperiod=self.macd_slow,
+                signalperiod=self.macd_signal
+            )
             histogram = macd_line - signal_line
             macd_bullish = (
                 (macd_line.iloc[-1] > signal_line.iloc[-1]) and
@@ -3766,21 +3660,34 @@ class KrakenAdvancedGridStrategy:
             )
             
             # Add reversal confirmation
-            rsi = ta.RSI(df['close'], 14).iloc[-1]
-            rsi_prev = ta.RSI(df['close'], 14).iloc[-2]
+            rsi = talib.RSI(df['close'], 14).iloc[-1]
+            rsi_prev = talib.RSI(df['close'], 14).iloc[-2]
             rsi_bullish = (rsi > 30) and (rsi_prev <= 30)  # Cross above oversold
             
+
             # Strengthen MACD check
             macd_rising = (macd_line.iloc[-1] > macd_line.iloc[-2])  # MACD histogram rising
             
-            # Volume spike check (matches line 3775-3778)
+            # Volume spike check with NaN handling
             current_volume = df['volume'].iloc[-1]
-            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
+            
+            # Handle empty/invalid volume data
+            if len(df) < 20 or df['volume'].isnull().all():
+                vol_ma = current_volume  # Fallback to current volume
+            else:
+                vol_ma = df['volume'].rolling(20, min_periods=1).mean().iloc[-1]
+            
             volume_spike = current_volume > vol_ma * 1.3
             
-            # Volatility filter (aligned with line 3784-3791)
+            # Calculate ATR before logging
             current_price = df['close'].iloc[-1]
-            atr = ta.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            
+            # Now safe to log both values
+            volume_ratio = current_volume / vol_ma if (vol_ma > 0 and not pd.isna(vol_ma)) else 0
+            logger.info(f"Volume: {volume_ratio:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
+
+            # Volatility filter (aligned with line 3784-3791)
             valid_atr = 0.015 <= (atr/current_price) <= 0.03  # 1.5-3% range
             
             # Support alignment (using 15m levels from line 830-833)
@@ -3872,14 +3779,16 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"Price: ${current_price:.4f}")
             
             # Calculate base technical indicators
-            rsi = ta.RSI(df['close'], timeperiod=14).iloc[-1]
-            bb_upper, bb_middle, bb_lower = ta.BBANDS(df['close'], timeperiod=20)
+            rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1]
+            bb_upper, bb_middle, bb_lower = talib.BBANDS(df['close'], timeperiod=20)
             bb_width = (bb_upper.iloc[-1] - bb_lower.iloc[-1]) / bb_middle.iloc[-1]
-            atr = ta.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+
+            atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
             
+
             # Daily timeframe conditions
-            daily_ema9 = ta.EMA(daily_df['close'], timeperiod=9)
-            daily_ema21 = ta.EMA(daily_df['close'], timeperiod=21)
+            daily_ema9 = talib.EMA(daily_df['close'], timeperiod=9)
+            daily_ema21 = talib.EMA(daily_df['close'], timeperiod=21)
             
             # Define daily EMA cross
             daily_ema_cross = (
@@ -3892,9 +3801,10 @@ class KrakenAdvancedGridStrategy:
                 logger.info("❌ No daily 9/21 EMA bullish cross")
                 return False
             
-            daily_rsi = ta.RSI(daily_df['close'], timeperiod=14).iloc[-1]
-            daily_rsi_prev = ta.RSI(daily_df['close'], timeperiod=14).iloc[-2]
-            daily_macd = ta.MACD(daily_df['close'])
+            daily_rsi = talib.RSI(daily_df['close'], timeperiod=14).iloc[-1]
+            daily_rsi_prev = talib.RSI(daily_df['close'], timeperiod=14).iloc[-2]
+            daily_macd = talib.trend.MACD(daily_df['close'])
+
             daily_macd_cross = (
                 daily_macd.macd().iloc[-1] > daily_macd.macd_signal().iloc[-1] and
                 daily_macd.macd().iloc[-2] <= daily_macd.macd_signal().iloc[-2]
@@ -3931,9 +3841,10 @@ class KrakenAdvancedGridStrategy:
                     return False
                 
                 # 2. Check 4H and 1H RSI
-                four_hour_rsi = ta.RSI(four_hour_df['close'], timeperiod=14).iloc[-1]
-                hourly_rsi = ta.RSI(hourly_df['close'], timeperiod=14).iloc[-1]
+                four_hour_rsi = talib.RSI(four_hour_df['close'], timeperiod=14).iloc[-1]
+                hourly_rsi = talib.RSI(hourly_df['close'], timeperiod=14).iloc[-1]
                 
+
                 if four_hour_rsi < 50 or hourly_rsi < 50:
                     logger.info("❌ 4H or 1H RSI below 50")
                     return False
@@ -3962,10 +3873,11 @@ class KrakenAdvancedGridStrategy:
                     return False
                 
                 # 4. Check 5min EMAs and MACD
-                ema9 = ta.EMA(five_min_df['close'], timeperiod=9).iloc[-1]
-                ema21 = ta.EMA(five_min_df['close'], timeperiod=21).iloc[-1]
-                ema200 = ta.EMA(five_min_df['close'], timeperiod=200).iloc[-1]
+                ema9 = talib.EMA(five_min_df['close'], timeperiod=9).iloc[-1]
+                ema21 = talib.EMA(five_min_df['close'], timeperiod=21).iloc[-1]
+                ema200 = talib.EMA(five_min_df['close'], timeperiod=200).iloc[-1]
                 
+
                 if not (ema9 > ema21 > ema200):
                     logger.info("❌ EMAs not in bullish alignment")
                     return False
@@ -4000,10 +3912,11 @@ class KrakenAdvancedGridStrategy:
                     return False
                 
                 # Technical Structure
-                ema9 = ta.EMA(df['close'], timeperiod=9).iloc[-1]
-                ema21 = ta.EMA(df['close'], timeperiod=21).iloc[-1]
-                ema200 = ta.EMA(df['close'], timeperiod=200).iloc[-1]
+                ema9 = talib.EMA(df['close'], timeperiod=9).iloc[-1]
+                ema21 = talib.EMA(df['close'], timeperiod=21).iloc[-1]
+                ema200 = talib.EMA(df['close'], timeperiod=200).iloc[-1]
                 
+
                 # Check EMA alignment for trend
                 if current_price < ema200:
                     logger.info("❌ Price below 200 EMA - Not in uptrend")
@@ -4023,10 +3936,11 @@ class KrakenAdvancedGridStrategy:
                     return False
                 
                 # 5. MACD Momentum
-                macd = ta.MACD(df['close'])
+                macd = talib.MACD(df['close'])
                 if macd.macd().iloc[-1] < macd.macd_signal().iloc[-1]:
                     logger.info("❌ MACD below signal line - Weak momentum")
                     return False
+
                 
                 logger.info("\n✅ Regular asset entry conditions met:")
                 logger.info(f"- Daily timeframe confirmation")
@@ -4480,6 +4394,7 @@ if __name__ == "__main__":
         
         # Initialize strategy
         strategy = KrakenAdvancedGridStrategy(demo_mode=False)
+        strategy.is_spot = True  # Force spot mode
         
         # Run with proper error handling
         loop = asyncio.get_event_loop()
