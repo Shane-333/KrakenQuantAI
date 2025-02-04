@@ -1336,6 +1336,9 @@ class KrakenAdvancedGridStrategy:
                         logger.info(f"✅ Successfully placed {side} order at {price} for {size} {symbol}")
                         logger.info(f"Order ID: {order['id']}")
                     
+                    # Refresh grid levels after each trade
+                    await self.refresh_grid_levels(symbol)
+                    
                     await asyncio.sleep(0.1)  # Rate limiting between orders
                     
                 except Exception as e:
@@ -4383,6 +4386,30 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Weekend check error: {e}")
             return False
     
+    async def refresh_grid_levels(self, symbol: str) -> None:
+        """Recalculate grid levels after trades"""
+        try:
+            logger.info(f"🔄 Refreshing grid levels for {symbol}")
+            
+            # Get updated market data
+            df = await self.get_historical_data(symbol)
+            if df is None or df.empty:
+                logger.warning(f"❌ No data for {symbol} refresh")
+                return
+                
+            # Recalculate support/resistance
+            support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
+            
+            # Update grid prices
+            current_price = df['close'].iloc[-1]
+            grid_prices = await self.calculate_hybrid_grids(
+                symbol, df, support_levels, resistance_levels
+            )
+            logger.info(f"Current price: {current_price} | Grid levels: {len(grid_prices)}")
+            
+        except Exception as e:
+            logger.error(f"Grid refresh error: {e}")
+
 if __name__ == "__main__":
     try:
         # Set up proper event loop policy for Windows
