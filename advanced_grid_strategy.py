@@ -1497,7 +1497,17 @@ class KrakenAdvancedGridStrategy:
     async def manage_stop_loss(self, symbol: str, position: Dict, current_price: float) -> None:
         """Manage stop loss and take profits for both spot and margin positions"""
         try:
-            # Get position details
+            # Get verified positions first
+            verified_positions = await self.verify_actual_positions()
+            verified_position = next((p for p in verified_positions if p['symbol'] == symbol), None)
+            
+            if verified_position:
+                # Update position with verified data
+                position['info']['price'] = verified_position['info']['price']
+                position['info']['size'] = verified_position['info']['size']
+                self.active_positions[symbol] = verified_position  # Update tracking
+                
+            # Get position details with verified data
             entry_price = float(position['info']['price'])
             position_side = position['info'].get('side', 'long')
             position_size = float(position['info'].get('size', 0))
@@ -3687,8 +3697,11 @@ class KrakenAdvancedGridStrategy:
             atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
             
             # Now safe to log both values
-            volume_ratio = current_volume / vol_ma if (vol_ma > 0 and not pd.isna(vol_ma)) else 0
-            logger.info(f"Volume: {volume_ratio:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
+            try:
+                vol_ratio = current_volume/vol_ma if vol_ma and vol_ma > 0 else 0
+                logger.info(f"Volume: {vol_ratio:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
+            except (ZeroDivisionError, ValueError):
+                logger.info(f"Volume: N/A | ATR: {(atr/current_price)*100:.1f}%")
 
             # Volatility filter (aligned with line 3784-3791)
             valid_atr = 0.015 <= (atr/current_price) <= 0.03  # 1.5-3% range
@@ -4160,12 +4173,13 @@ class KrakenAdvancedGridStrategy:
             return size  # Return original size if validation fails
 
     async def verify_actual_positions(self) -> List[Dict]:
-        """Verify actual positions vs open orders"""
+        """Verify actual positions with accurate spot tracking"""
         try:
+            # Fetch balance and markets data
             balance = await self.exchange.fetch_balance()
             markets = await self.exchange.fetch_markets()
             
-            # Create mapping of cleaned currencies to proper symbols
+            # Create normalized symbol mapping
             symbol_map = {
                 m['base'].replace('XBT', 'BTC')
                           .replace('XX', '')
@@ -4177,6 +4191,7 @@ class KrakenAdvancedGridStrategy:
 
             actual_positions = []
             for currency, amount in balance.get('total', {}).items():
+                # Normalize currency symbol
                 clean_currency = currency.replace('XBT', 'BTC') \
                                       .replace('XX', '') \
                                       .replace('Z', '') \
@@ -4190,33 +4205,19 @@ class KrakenAdvancedGridStrategy:
                     try:
                         proper_symbol = symbol_map[clean_currency]
                         
-                        # Get ALL trades for this symbol in last 30 days
-                        since = self.exchange.milliseconds() - (86400 * 1000 * 30)  # 30 days
-                        trades = await self.exchange.fetch_my_trades(proper_symbol, since=since)
+                        # Calculate average entry price from recent orders
+                        orders = await self.exchange.fetch_orders(proper_symbol, since=self.start_time)
+                        buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
                         
-                        # Find initial entry price from buy trades
-                        buy_trades = [t for t in trades if t['side'] == 'buy']
-                        if buy_trades:
-                            # Sort by timestamp to get earliest buys first
-                            buy_trades.sort(key=lambda x: x['timestamp'])
-                            # Take first few buys that match our current position size
-                            accumulated = 0
-                            cost = 0
-                            for trade in buy_trades:
-                                if accumulated < total_amount:
-                                    trade_amount = float(trade['amount'])
-                                    trade_cost = float(trade['cost'])
-                                    accumulated += trade_amount
-                                    cost += trade_cost
-                            
-                            if accumulated > 0:
-                                entry_price = cost / accumulated
-                                logger.info(f"Found initial entry for {proper_symbol} at {entry_price:.6f}")
-                            else:
-                                entry_price = await self.get_current_price(proper_symbol)
+                        if buy_orders:
+                            total_cost = sum(o['filled'] * o['average'] for o in buy_orders)
+                            total_amount = sum(o['filled'] for o in buy_orders)
+                            entry_price = total_cost / total_amount
                         else:
+                            # Fallback to current price if no orders found
                             entry_price = await self.get_current_price(proper_symbol)
                         
+                        # Create position dictionary
                         position = {
                             'symbol': proper_symbol,
                             'info': {
@@ -4228,7 +4229,7 @@ class KrakenAdvancedGridStrategy:
                             }
                         }
                         
-                        # Update both tracking systems
+                        # Update tracking systems
                         self.active_positions[proper_symbol] = position
                         self.positions[proper_symbol] = {
                             'entry_price': entry_price,
@@ -4244,7 +4245,9 @@ class KrakenAdvancedGridStrategy:
                         }
                         
                         actual_positions.append(position)
-                        logger.info(f"Verified position: {proper_symbol} - Entry: {entry_price:.6f}")
+                        logger.info(f"Verified spot position: {proper_symbol}")
+                        logger.info(f"Size: {total_amount}")
+                        logger.info(f"Entry: {entry_price:.6f}")
                         
                     except Exception as e:
                         logger.error(f"Position error {clean_currency}: {str(e)[:100]}")
