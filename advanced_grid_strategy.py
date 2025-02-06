@@ -7,12 +7,14 @@ import pandas as pd
 import numpy as np
 import ta
 import talib
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import traceback
+import pytz
 from market_analysis import MarketAnalyzer
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +22,11 @@ logger = logging.getLogger(__name__)
 class KrakenAdvancedGridStrategy:
     def __init__(self, demo_mode=False):  # Set default to False for live
         self.demo_mode = demo_mode
+        self.STABLE_BLACKLIST = {
+        'EUR/USD', 'USDC/USD', 'USDT/USD',
+        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD'
+    }
+
         
         # Load environment variables
         load_dotenv()
@@ -171,6 +178,11 @@ class KrakenAdvancedGridStrategy:
         
         # Remove training task creation from here
         self.training_tasks = []  # Just initialize empty list
+        self.has_sufficient_funds = True  # Add this line to initialize the attribute
+
+        # Add this line in your __init__
+        self.atr_periods = 14  # Standard 14-period ATR
+        self.is_spot = False  # Default to False
 
     def initialize_exchange(self) -> None:
         """Initialize CCXT exchange connection"""
@@ -243,56 +255,36 @@ class KrakenAdvancedGridStrategy:
                 total_amount = float(amount)
                 if total_amount > 0.00001:  # Minimum threshold
                     try:
-                        symbol = f"{currency}/USD"
+                        # Get proper normalized symbol
+                        symbol = self.normalize_symbol(f"{currency}/USD")
                         
-                        # Get the entry price from order history
-                        orders = await self.exchange.fetch_closed_orders(symbol)
-                        filled_buys = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
+                        # Get current price from order book spread
+                        orderbook = await self.exchange.fetch_order_book(symbol)
+                        bid = orderbook['bids'][0][0] if orderbook['bids'] else 0
+                        ask = orderbook['asks'][0][0] if orderbook['asks'] else 0
+                        mid_price = (bid + ask) / 2
                         
-                        if filled_buys:
-                            entry_price = float(filled_buys[0]['price'])
-                            logger.info(f"Found actual spot position for {symbol}:")
-                            logger.info(f"Balance: {total_amount} {currency}")
-                            logger.info(f"Entry: ${entry_price}")
-                            
-                            spot_position = {
+                        # Calculate entry price using spread-adjusted mid price
+                        entry_price = await self.get_average_entry_price(symbol, total_amount, mid_price)
+                        
+                        position = {
+                            'symbol': symbol,
+                            'info': {
                                 'symbol': symbol,
-                                'info': {
-                                    'symbol': symbol,
-                                    'size': total_amount,
-                                    'price': entry_price,
-                                    'side': 'long',
-                                    'is_spot': True
-                                }
+                                'size': total_amount,
+                                'price': entry_price,  # Use spread-adjusted price
+                                'side': 'long',
+                                'is_spot': True
                             }
-                            
-                            active_positions.append(spot_position)
-                            logger.info(f"Active spot position: {symbol}: long {total_amount} @ {entry_price}")
+                        }
+                        active_positions.append(position)
                     except Exception as e:
-                        logger.error(f"Error processing {currency} balance: {e}")
+                        logger.error(f"Error processing {currency} position: {str(e)[:100]}")
                         continue
-            
-            # Log summary of actual positions
-            if active_positions:
-                logger.info("\nActive Positions Summary:")
-                for pos in active_positions:
-                    symbol = pos['info']['symbol']
-                    try:
-                        current_price = await self.get_current_price(symbol)
-                        if current_price:  # Only call manage_stop_loss if we have a valid price
-                            await self.manage_stop_loss(symbol, pos, current_price)
-                            logger.info(f"{symbol}: {pos['info']['side']} {pos['info']['size']} @ {pos['info']['price']}")
-                        else:
-                            logger.error(f"Could not get current price for {symbol}")
-                    except Exception as e:
-                        logger.error(f"Error processing position for {symbol}: {e}")
-            else:
-                logger.info("No active positions found")
-            
             return active_positions
-                
+            
         except Exception as e:
-            logger.error(f"Error getting open positions: {e}")
+            logger.error(f"Failed to get open positions: {e}")
             return []
 
     async def get_historical_data(self, symbol: str, timeframe: str = '1h', limit: int = 100) -> pd.DataFrame:
@@ -315,17 +307,29 @@ class KrakenAdvancedGridStrategy:
             
             interval = timeframe_minutes.get(timeframe, 60)  # Default to 1h
             
+            # Calculate required periods for all indicators
+            required_periods = max(
+                self.rsi_period,
+                self.ema_long_period,
+                self.bb_period,
+                self.atr_period,
+                self.macd_slow
+            )
+            
+            # Add buffer and fetch more data than needed
+            fetch_limit = max(limit, required_periods * 2)
+            
             # Get OHLCV data using Kraken's specific endpoint
             ohlcv = await self.exchange.fetch_ohlcv(
                 symbol, 
                 timeframe,
-                limit=limit,
+                limit=fetch_limit,
                 params={"interval": interval}
             )
             
-            if not ohlcv:
-                logger.error(f"No OHLCV data returned for {symbol}")
-                return None
+            if not ohlcv or len(ohlcv) < required_periods:
+                logger.error(f"Insufficient data for {symbol}. Need {required_periods} periods, got {len(ohlcv) if ohlcv else 0}")
+                return pd.DataFrame()
                 
             logger.info(f"Received {len(ohlcv)} candles for {symbol}")
             
@@ -334,128 +338,228 @@ class KrakenAdvancedGridStrategy:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             
-            # Calculate existing indicators
-            df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
-            df['ema_short'] = ta.trend.EMAIndicator(df['close'], self.ema_short_period).ema_indicator()
-            df['ema_long'] = ta.trend.EMAIndicator(df['close'], self.ema_long_period).ema_indicator()
-            df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], self.atr_period).average_true_range()
+            # Ensure minimum required data
+            if len(df) < required_periods:
+                logger.warning(f"Insufficient data ({len(df)} rows) for {symbol}. Need {required_periods} periods")
+                return pd.DataFrame()
+
+            # Wrap each indicator in try/except
+            try:
+                df['rsi'] = talib.RSI(df['close'], timeperiod=14)
+            except Exception as e:
+                logger.error(f"RSI Error for {symbol}: {e}")
+                df['rsi'] = np.nan
+
+            try:
+                df['ema_short'] = ta.trend.EMAIndicator(df['close'], self.ema_short_period).ema_indicator()
+                df['ema_long'] = ta.trend.EMAIndicator(df['close'], self.ema_long_period).ema_indicator()
+            except Exception as e:
+                logger.error(f"EMA Error for {symbol}: {e}")
+                df['ema_short'] = df['close']
+                df['ema_long'] = df['close']
+
+            try:
+                df['atr'] = ta.volatility.AverageTrueRange(
+                    df['high'], 
+                    df['low'], 
+                    df['close'], 
+                    window=self.atr_period
+                ).average_true_range()
+            except Exception as e:
+                logger.error(f"ATR Error for {symbol}: {e}")
+                df['atr'] = 0
             
-            # Calculate MACD
-            macd = ta.trend.MACD(
-                df['close'], 
-                window_slow=self.macd_slow, 
-                window_fast=self.macd_fast, 
-                window_sign=self.macd_signal
-            )
-            df['macd'] = macd.macd()
-            df['macd_signal'] = macd.macd_signal()
-            df['macd_histogram'] = macd.macd_diff()
+            # Calculate MACD with error handling
+            try:
+                macd_line, signal_line, macd_hist = talib.MACD(
+                    df['close'], 
+                    fastperiod=self.macd_fast,  # Correct parameter name
+                    slowperiod=self.macd_slow,   # Correct parameter name
+                    signalperiod=self.macd_signal
+                )
+                df['macd'] = macd_line
+                df['macd_signal'] = signal_line
+                df['macd_histogram'] = macd_hist
+            except Exception as e:
+                logger.error(f"MACD Error for {symbol}: {e}")
+                df['macd'] = 0
+                df['macd_signal'] = 0
+                df['macd_histogram'] = 0
             
-            # Calculate Bollinger Bands
-            bollinger = ta.volatility.BollingerBands(
-                df['close'],
-                window=self.bb_period,
-                window_dev=self.bb_std
-            )
-            df['bb_upper'] = bollinger.bollinger_hband()
-            df['bb_middle'] = bollinger.bollinger_mavg()
-            df['bb_lower'] = bollinger.bollinger_lband()
+            # Calculate Bollinger Bands with error handling
+            try:
+                bollinger = ta.volatility.BollingerBands(
+                    df['close'],
+                    window=self.bb_period,
+                    window_dev=self.bb_std
+                )
+                df['bb_upper'] = bollinger.bollinger_hband()
+                df['bb_middle'] = bollinger.bollinger_mavg()
+                df['bb_lower'] = bollinger.bollinger_lband()
+                
+                # Calculate Bollinger Band Width
+                df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+            except Exception as e:
+                logger.error(f"Bollinger Bands Error for {symbol}: {e}")
+                df['bb_upper'] = df['close']
+                df['bb_middle'] = df['close']
+                df['bb_lower'] = df['close']
+                df['bb_width'] = 0
             
-            # Calculate Bollinger Band Width
-            df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+            # Drop any NaN values and return a copy
+            df_clean = df.dropna().copy()
             
-            logger.info(f"Calculated all indicators for {symbol}")
-            logger.info(f"Latest RSI: {df['rsi'].iloc[-1]:.2f}")
-            logger.info(f"Latest MACD: {df['macd'].iloc[-1]:.4f}")
-            logger.info(f"Latest BB Width: {df['bb_width'].iloc[-1]:.4f}")
+            if len(df_clean) > 0:
+                logger.info(f"Calculated indicators for {symbol}:")
+                logger.info(f"Latest RSI: {df_clean['rsi'].iloc[-1]:.2f}")
+                logger.info(f"Latest MACD: {df_clean['macd'].iloc[-1]:.4f}")
+                logger.info(f"Latest BB Width: {df_clean['bb_width'].iloc[-1]:.4f}")
             
-            return df
+            return df_clean
                 
         except Exception as e:
-            logger.error(f"Error getting historical data for {symbol}: {e}")
-            return None
+            logger.error(f"Historical data error for {symbol}: {str(e)[:200]}")
+            return pd.DataFrame()
 
     async def analyze_market_conditions(self, df: pd.DataFrame, symbol: str) -> Tuple[bool, float]:
         """Analyze market conditions using technical indicators and FinBERT sentiment"""
         try:
+            # Validate input DataFrame
+            if df is None or len(df) < 1:
+                logger.error(f"Invalid DataFrame for {symbol}")
+                return False, 0.0
+
+            # Add market state detection ===============
+            daily_df = await self.get_historical_data(symbol, '1d')
+            if daily_df is not None and len(daily_df) >= 200:
+                daily_ma_200 = daily_df['close'].rolling(200).mean().iloc[-1]
+                current_daily_close = daily_df['close'].iloc[-1]
+                market_state = "bull" if current_daily_close > daily_ma_200 else "bear"
+                logger.info(f"Market State: {market_state.upper()}")
+                
+                # Set dynamic thresholds
+                min_sentiment = 0.55 if market_state == "bear" else 0.6
+                rsi_floor = 35 if market_state == "bear" else 30
+                max_volatility = 0.4 if market_state == "bear" else 0.6
+            else:
+                logger.warning("Using default thresholds - insufficient daily data")
+                min_sentiment = 0.6
+                rsi_floor = 30
+                max_volatility = 0.6
+
             # Check if we have insufficient funds and there's no active position
             if not self.has_sufficient_funds and symbol not in self.active_positions:
                 return False, 0.0  # Skip analysis for new positions
                 
             # Quick check for active positions first (always check regardless of funds)
             if symbol in self.active_positions:
-                current_price = df.iloc[-1]['close']
+                current_price = float(df.iloc[-1]['close'])
                 position = self.active_positions[symbol]
                 await self.manage_stop_loss(symbol, position, current_price)
             
             # Only continue analysis if we have funds or an active position
             if self.has_sufficient_funds or symbol in self.active_positions:
-                # Rest of existing analysis code...
-                async with asyncio.timeout(15):  # Increased from 5 to 15 seconds
+                async with asyncio.timeout(15):  # 15 second timeout
                     tasks = []
                     last_row = df.iloc[-1]
-                    technical_data = {
-                        'technical': {
-                            'indicators': {
-                                'rsi': last_row['rsi'],
-                                'ema_short': last_row['ema_short'],
-                                'ema_long': last_row['ema_long'],
-                                'macd': last_row['macd'],
-                                'bb_width': last_row['bb_width'],
-                                'atr': last_row['atr']
+                    
+                    # Format price data correctly for sentiment analysis
+                    try:
+                        price_data = {
+                            'timeframe': '1h',
+                            'price_data': {
+                                'open': df['open'].astype(float).tolist(),
+                                'high': df['high'].astype(float).tolist(),
+                                'low': df['low'].astype(float).tolist(),
+                                'close': df['close'].astype(float).tolist()
                             }
                         }
-                    }
+                    except Exception as e:
+                        logger.error(f"Error formatting price data: {e}")
+                        return False, 0.0
+                    
+                    # Warm up model first
+                    await self.market_analyzer.warmup_model()
                     
                     # Add timeout for sentiment analysis
                     ai_task = asyncio.create_task(
                         asyncio.wait_for(
-                            self.market_analyzer.get_market_sentiment(technical_data, symbol),
-                            timeout=15
+                            self.market_analyzer.get_market_sentiment(price_data, symbol),
+                            timeout=25
                         )
                     )
                     tasks.append(ai_task)
                     
-                    # Task 2: Calculate technical signals concurrently
+                    # Add timeout error handling
+                    try:
+                        await ai_task
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Sentiment analysis timeout for {symbol}")
+                        return False, 0.0
+                    
+                    # Task 2: Calculate technical signals concurrently with error handling
                     def calculate_signals():
-                        rsi = last_row['rsi']
-                        rsi_signal = 30 <= rsi <= 70
-                        
-                        ema_trend = last_row['ema_short'] > last_row['ema_long']
-                        
-                        macd_cross = last_row['macd'] > last_row['macd_signal']
-                        
-                        current_bbw = last_row['bb_width']
-                        bbw_valid = current_bbw < 0.5
-                        
-                        return rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid
+                        try:
+                            rsi = float(last_row['rsi'])
+                            # Use dynamic RSI floor from market state
+                            rsi_signal = rsi_floor <= rsi <= 70
+                            
+                            ema_trend = float(last_row['ema_short']) > float(last_row['ema_long'])
+                            
+                            macd_cross = float(last_row['macd']) > float(last_row['macd_signal'])
+                            
+                            current_bbw = float(last_row['bb_width'])
+                            bbw_valid = current_bbw < 0.5
+                            
+                            return rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid
+                        except Exception as e:
+                            logger.error(f"Error calculating technical signals: {e}")
+                            return False, False, False, 0.0, False
                     
                     # Run technical analysis in thread pool
                     loop = asyncio.get_event_loop()
                     tech_task = loop.run_in_executor(self.market_analyzer.thread_pool, calculate_signals)
                     tasks.append(tech_task)
                     
-                    # Wait for all tasks to complete
-                    sentiment_score, tech_signals = await asyncio.gather(*tasks)
-                    
-                    # Unpack technical signals
-                    rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid = tech_signals
-                    
-                    # Calculate final signals (using sentiment score directly)
-                    signal_strength = (
-                        (1 if rsi_signal else 0) +
-                        (1 if ema_trend else 0) +
-                        (1 if macd_cross else 0) +
-                        (1 if bbw_valid else 0) +
-                        (sentiment_score)  # Add sentiment as part of signal strength
-                    ) / 5.0
-                    
-                    should_trade = signal_strength >= 0.6  # Adjusted threshold
-                    
-                    logger.info(f"Analysis complete - Sentiment: {sentiment_score:.2f}, Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
-                    
-                    return should_trade, current_bbw
-                    
+                    # Wait for all tasks with error handling
+                    try:
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        
+                        # Check for exceptions in results
+                        if any(isinstance(r, Exception) for r in results):
+                            logger.error(f"Task error in analysis: {[r for r in results if isinstance(r, Exception)]}")
+                            return False, 0.0
+                            
+                        sentiment_score, tech_signals = results
+                        
+                        # Validate sentiment score
+                        if not isinstance(sentiment_score, (int, float)) or sentiment_score < 0 or sentiment_score > 1:
+                            logger.error(f"Invalid sentiment score: {sentiment_score}")
+                            return False, 0.0
+                        
+                        # Unpack technical signals
+                        rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid = tech_signals
+                        
+                        # Calculate final signals with dynamic sentiment threshold
+                        signal_strength = (
+                            (1 if rsi_signal else 0) +
+                            (1 if ema_trend else 0) +
+                            (1 if macd_cross else 0) +
+                            (1 if bbw_valid else 0) +
+                            float(sentiment_score)
+                        ) / 5.0
+                        
+                        # Use market-state adjusted minimum sentiment
+                        should_trade = signal_strength >= min_sentiment
+                        
+                        logger.info(f"Analysis complete - Sentiment: {sentiment_score:.2f} (Req: {min_sentiment}), Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
+                        
+                        return should_trade, current_bbw
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing analysis results: {e}")
+                        return False, 0.0
+
         except asyncio.TimeoutError:
             logger.error(f"Analysis timeout for {symbol}")
             return False, 0.0
@@ -730,7 +834,7 @@ class KrakenAdvancedGridStrategy:
         """Calculate support and resistance levels using daily, 15m and 5m timeframes"""
         try:
             # Get multi-timeframe data
-            daily_df = await self.get_historical_data(symbol, timeframe='1d', limit=100)  # ~3 months
+            daily_df = await self.get_historical_data(symbol, '1d')
             fifteen_min_df = await self.get_historical_data(symbol, timeframe='15m', limit=100)  # ~24h
             five_min_df = await self.get_historical_data(symbol, timeframe='5m', limit=72)      # Last 6h
             
@@ -987,7 +1091,7 @@ class KrakenAdvancedGridStrategy:
             # Adjust grid levels based on technical analysis
             if is_spot:
                 # Add more buy grids if oversold in higher timeframes
-                if trend_data['1h']['is_oversold'] and trend_data['1h']['near_support']:
+                if trend_data['1h']['is_oversold'] and trend_data['1h']['near_support'] and trend_data['1h']['rsi'] > 45:
                     self.grid_levels += 1
                     logger.info("✅ Adding extra buy grid - Oversold conditions")
                 
@@ -1003,9 +1107,16 @@ class KrakenAdvancedGridStrategy:
  
             should_trade, volatility = await self.analyze_market_conditions(df, symbol)
             logger.info(f"Market conditions check - Should trade: {'✅' if should_trade else '❌'}, Volatility: {volatility:.2f}%")
+            if not should_trade:
+                return
             
             if not should_trade:
                 logger.info(f"❌ Market conditions not favorable for {symbol}, skipping")
+                return
+
+            five_min_df = await self.get_historical_data(symbol, '5m', 50)
+            if not await self._analyze_5m(five_min_df, symbol):
+                logger.info("❌ 5min conditions not met")
                 return
                 
             # Adjust grid parameters based on volatility
@@ -1105,13 +1216,25 @@ class KrakenAdvancedGridStrategy:
                                  (price_change < 0 and price_obj < current_price)
 
                 # Adjust validation requirements
+                rsi = talib.RSI(df['close'], 14).iloc[-1]  
+                macd_indicator = talib.trend.MACD(df['close'])
+                macd_line = macd_indicator.macd()
+                signal_line = macd_indicator.macd_signal()
+                histogram = macd_indicator.macd_diff()
+                macd_bullish = (
+                    (macd_line.iloc[-1] > signal_line.iloc[-1]) and
+                    (histogram.iloc[-1] > histogram.iloc[-2]) and
+                    (macd_line.iloc[-1] > 0)
+                )
                 valid_for_trade = (
-                    (momentum_aligned or volume_confirmed) or  # Need either momentum OR volume
+                    (momentum_aligned or volume_confirmed) and  # AND instead of OR
                     (
-                        (would_be_side == "buy" and is_near_support) or
-                        (would_be_side == "sell" and is_near_resistance) or
-                        normalized_confidence > 8  
-                    )
+
+                        (would_be_side == "buy" and is_near_support and rsi < 35) or
+                        (would_be_side == "sell" and is_near_resistance and rsi > 65)
+                    ) and 
+                    macd_bullish and  
+                    normalized_confidence > 8
                 )
                 
                 if valid_for_trade:
@@ -1157,6 +1280,18 @@ class KrakenAdvancedGridStrategy:
                 # Add size validation before fee check
                 size = await self.validate_grid_order_size(symbol, size)
                 logger.info(f"Validated position size: {size}")
+
+                # Add USD balance check for spot buys
+                if is_spot and side == "buy":
+                    try:
+                        usd_balance = (await self.exchange.fetch_balance())['USD']['free']
+                        order_cost = price * size
+                        if order_cost > usd_balance:
+                            logger.warning(f"❌ Insufficient USD balance: {usd_balance:.2f} < {order_cost:.2f}")
+                            continue
+                    except Exception as e:
+                        logger.error(f"Balance check error: {e}")
+                        continue
                 
                 # Add fee validation
                 if not self.validate_trade_profitability(price, size, symbol):
@@ -1201,6 +1336,9 @@ class KrakenAdvancedGridStrategy:
                         logger.info(f"✅ Successfully placed {side} order at {price} for {size} {symbol}")
                         logger.info(f"Order ID: {order['id']}")
                     
+                    # Refresh grid levels after each trade
+                    await self.refresh_grid_levels(symbol)
+                    
                     await asyncio.sleep(0.1)  # Rate limiting between orders
                     
                 except Exception as e:
@@ -1216,57 +1354,17 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"❌ Error executing grid orders: {e}")
 
     async def get_current_price(self, symbol: str) -> float:
-        """Get current price with enhanced error handling and validation"""
+        """Get current price using last trade price with bid/ask spread awareness"""
         try:
-            # Check cache first with strict timeout
-            cached_price = self.current_prices.get(symbol)
-            cache_time = self.price_update_times.get(symbol, 0)
-            if cached_price and time.time() - cache_time < 15:  # 15-second cache
-                return cached_price
-
-            # Fetch new price with retry and longer delay
-            for attempt in range(3):
-                try:
-                    # Add delay between retries
-                    if attempt > 0:
-                        await asyncio.sleep(1)
-                        
-                    ticker = await self.exchange.fetch_ticker(symbol)
-                    if not ticker:
-                        logger.warning(f"No ticker data received for {symbol}")
-                        continue
-                    
-                    # Try last price first
-                    price = ticker.get('last')
-                    if price is not None:
-                        price = float(price)
-                        if price > 0:
-                            self.current_prices[symbol] = price
-                            self.price_update_times[symbol] = time.time()
-                            return price
-                    
-                    # Fall back to bid/ask average
-                    bid = ticker.get('bid')
-                    ask = ticker.get('ask')
-                    if bid is not None and ask is not None:
-                        price = (float(bid) + float(ask)) / 2
-                        if price > 0:
-                            self.current_prices[symbol] = price
-                            self.price_update_times[symbol] = time.time()
-                            return price
-                        
-                    logger.warning(f"No valid price found in ticker for {symbol}")
-                        
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} failed for {symbol}: {str(e)}")
-                
-            # If we get here, we failed to get a valid price
-            logger.error(f"Failed to get valid price for {symbol} after all attempts")
-            return None
-                
+            ticker = await self.exchange.fetch_ticker(symbol)
+            # Use last price but verify against spread
+            spread = ticker['ask'] - ticker['bid']
+            if spread > ticker['last'] * 0.001:  # More than 0.1% spread
+                return (ticker['bid'] + ticker['ask']) / 2  # Use mid price
+            return ticker['last']
         except Exception as e:
-            logger.error(f"Error in get_current_price for {symbol}: {e}")
-            return None
+            logger.error(f"Error getting price for {symbol}: {e}")
+            return 0.0
 
     async def calculate_grid_levels(self, current_price: float, symbol: str = None) -> List[float]:
         """Calculate grid price levels with dynamic precision and position sizing"""
@@ -1368,159 +1466,32 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error calculating grid levels: {e}")
             return []
 
-    async def calculate_position_size(self, price: float, symbol: str = None) -> float:
-        """Calculate position size with dynamic account scaling and volatility"""
+    async def calculate_position_size(self, current_price: float, symbol: str) -> float:
+        """Safe position sizing with error handling"""
         try:
-            account_value = self.last_balance
-            logger.info(f"\n{'='*50}")
-            logger.info(f"📊 POSITION SIZING FOR {symbol}")
-            logger.info(f"Account Value: ${account_value:.2f}")
-            logger.info(f"Current Price: ${price:.2f}")
-
-            # Initialize volatility
-            volatility = 1.0  # Default value
-            try:
-                volatility = await self.get_asset_volatility(symbol)
-            except Exception as e:
-                logger.warning(f"Using default volatility: {e}")
-
-            # Dynamic allocation based on account size AND number of grid levels
-            grid_levels = 4  # Typical number of grid levels
-            allocation_scale = {
-                (0, 50): 0.25/grid_levels,    # 25% total for micro accounts (<$50)
-                (50, 100): 0.20/grid_levels,  # 20% total for very small accounts
-                (100, 500): 0.15/grid_levels, # 15% total for small accounts
-                (500, 1000): 0.12/grid_levels,# 12% total for medium accounts
-                (1000, float('inf')): 0.10/grid_levels  # 10% total for larger accounts
-            }
-
-            # Find appropriate allocation percentage
-            allocation_percent = 0.05  # Default to 5%
-            for (min_val, max_val), alloc in allocation_scale.items():
-                if min_val <= account_value < max_val:
-                    allocation_percent = alloc
-                    break
-
-            # Get Kraken's minimum requirements
-            try:
-                markets = await self.exchange.fetch_markets()
-                market_info = next((m for m in markets if m['symbol'] == symbol), None)
-                if market_info:
-                    min_amount = float(market_info.get('limits', {}).get('amount', {}).get('min', 0))
-                    min_cost = float(market_info.get('limits', {}).get('cost', {}).get('min', 0))
-                    
-                    logger.info(f"Exchange Minimums:")
-                    logger.info(f"Min Amount: {min_amount}")
-                    logger.info(f"Min Cost: ${min_cost}")
-                else:
-                    raise Exception(f"Market info not found for {symbol}")
-                    
-            except Exception as e:
-                logger.warning(f"Could not fetch market limits: {e}")
-                # Strict fallback minimums based on logs
-                min_requirements = {
-                    'XRP/USD': 2.0,    # From logs: Min Amount: 2.0
-                    'SPX/USD': 3.5,    # From logs: Min Amount: 3.5
-                    'USDT/USD': 5.0,   # From logs: Min Amount: 5.0
-                    'SOL/USD': 0.1,    # Conservative estimate
-                    'BTC/USD': 0.0001, # Standard BTC minimum
-                    'ETH/USD': 0.01,   # Standard ETH minimum
-                    'default': 5.0     # Safe default
-                }
-                min_amount = min_requirements.get(symbol, min_requirements['default'])
-                min_cost = min_amount * price
-
-            # Calculate initial allocation (40% for small accounts)
-            initial_allocation = account_value * allocation_percent
-            position_size = initial_allocation / price
-
-            # CRITICAL: Ensure we meet minimum size requirements
-            position_size = max(position_size, min_amount)
+            if current_price <= 0:
+                logger.error(f"Invalid price {current_price} for {symbol}")
+                return 0.0
+                
+            # Get verified balance (matches line 460-472 fix)
+            balance = await self.exchange.fetch_balance()
+            asset = symbol.split('/')[0]
+            spot_balance = float(balance.get(asset, {}).get('free', 0)) + \
+                           float(balance.get(asset, {}).get('used', 0))
             
-            logger.info(f"Base size before minimums: {position_size:.4f}")
-            logger.info(f"Required minimum: {min_amount:.4f}")
-
-            # Apply volatility scaling if we're above minimums
-            if position_size > min_amount:
-                try:
-                    vol_scale = {
-                        (0, 1): 1.0,      # Very low vol: normal size
-                        (1, 2): 0.9,      # Low vol: slightly reduced
-                        (2, 3): 0.8,      # Moderate vol: reduced
-                        (3, 5): 0.7,      # High vol: significantly reduced
-                        (5, 8): 0.6,      # Very high vol: minimum size
-                        (8, float('inf')): 0.4  # Extreme vol: ultra conservative
-                    }
-                    
-                    vol_factor = 0.4  # Default to most conservative
-                    for (vol_min, vol_max), scale in vol_scale.items():
-                        if vol_min <= volatility < vol_max:
-                            vol_factor = scale
-                            break
-                    
-                    position_size *= vol_factor
-                    position_size = max(position_size, min_amount)  # Ensure we still meet minimums
-                    logger.info(f"Volatility: {volatility:.2f}% (Scale: {vol_factor}x)")
-                    
-                except Exception as e:
-                    logger.warning(f"Using default volatility scaling: {e}")
-
-            # Calculate base position size
-            position_size = initial_allocation / price
+            if spot_balance <= 0:
+                logger.warning(f"No {asset} balance for {symbol}")
+                return 0.0
+                
+            # Risk management (1% of portfolio per trade)
+            portfolio_value = float(balance['total']['USD'])
+            position_size = (portfolio_value * 0.01) / current_price
             
-            # Ensure we meet exchange minimums
-            min_required = max(
-                min_amount,
-                min_cost / price if min_cost else 0
-            )
-            position_size = max(position_size, min_required)
+            logger.info(f"Position size calc: {portfolio_value=}, {current_price=}, {position_size=}")
+            return round(position_size, 4)
             
-            logger.info(f"Base size: {position_size:.4f}")
-            logger.info(f"Min required: {min_required:.4f}")
-
-            # Keep your existing entry scaling logic
-            if not hasattr(self, 'entry_counts'):
-                self.entry_counts = {}
-            entry_count = self.entry_counts.get(symbol, 0) + 1
-            self.entry_counts[symbol] = entry_count
-
-            # Enhanced scaling based on volatility
-            if entry_count <= 3:
-                if volatility <= 3:
-                    base_scale = {1: 1.0, 2: 1.5, 3: 2.0}.get(entry_count, 1.0)
-                elif volatility <= 5:
-                    base_scale = {1: 1.0, 2: 1.3, 3: 1.6}.get(entry_count, 1.0)
-                else:
-                    base_scale = {1: 1.0, 2: 1.2, 3: 1.4}.get(entry_count, 1.0)
-            
-                position_size *= base_scale
-                logger.info(f"Entry scaling: {base_scale}x (Entry #{entry_count})")
-
-            # Final rounding based on price range
-            if price >= 20000:  # BTC
-                position_size = round(position_size, 3)
-            elif price >= 1000:  # ETH
-                position_size = round(position_size, 2)
-            else:
-                position_size = round(position_size, 1)
-
-            # Final validation
-            position_value = position_size * price
-            if position_value > account_value * 0.40:  # Cap at 40% of account
-                position_size = (account_value * 0.40) / price
-                position_size = max(position_size, min_amount)  # Still ensure minimum
-                logger.warning("Position size reduced to stay within 40% account limit")
-
-            logger.info(f"\nFinal Position Details:")
-            logger.info(f"Size: {position_size:.4f}")
-            logger.info(f"Value: ${position_size * price:.2f}")
-            logger.info(f"Account %: {(position_size * price / account_value)*100:.1f}%")
-            logger.info(f"{'='*50}\n")
-
-            return position_size
-
         except Exception as e:
-            logger.error(f"Error calculating position size: {e}")
+            logger.error(f"Position size error: {e}")
             return 0.0
 
     async def manage_stop_loss(self, symbol: str, position: Dict, current_price: float) -> None:
@@ -1528,32 +1499,24 @@ class KrakenAdvancedGridStrategy:
         try:
             # Get position details
             entry_price = float(position['info']['price'])
-            position_side = position['info'].get('side', 'long')  # Default to 'long' for spot
+            position_side = position['info'].get('side', 'long')
             position_size = float(position['info'].get('size', 0))
             
             # Initialize position tracking if not exists
             if symbol not in self.positions:
                 # Get accurate entry from recent orders first
                 try:
-                    # FORCE spot check first before anything else
-                    balance = await self.exchange.fetch_balance()
-                    raw_asset = symbol.split('/')[0].replace(':USD', '')  # Remove :USD suffix
+                    # Force spot check first
+                    balance = await self.verify_actual_positions()
+                    raw_asset = symbol.split('/')[0].replace(':USD', '')
                     asset = raw_asset
                     spot_balance = float(balance.get(asset, {}).get('free', 0))
                     total_balance = float(balance.get(asset, {}).get('total', 0))
-                    is_spot = True  # FORCE SPOT for now
-                    
-                    logger.info(f"\n{'='*50}")
-                    logger.info(f"FORCING SPOT MODE for {symbol}:")
-                    logger.info(f"Asset: {asset}")
-                    logger.info(f"Free Balance: {spot_balance}")
-                    logger.info(f"Total Balance: {total_balance}")
-                    logger.info(f"Is Spot: {is_spot}")
-                    logger.info(f"{'='*50}\n")
-                    
-                    # Then get entry price with correct symbol format
-                    clean_symbol = f"{raw_asset}/USD"  # Use clean symbol format
-                    orders = await self.exchange.fetch_closed_orders(clean_symbol, limit=5)
+                    is_spot = True
+
+                    # Get entry price from order history
+                    clean_symbol = f"{raw_asset}/USD"
+                    orders = await self.get_average_entry_price(clean_symbol, limit=5)
                     entry_orders = [order for order in orders 
                                   if order['status'] == 'closed' 
                                   and order['side'] == 'buy']
@@ -1563,6 +1526,16 @@ class KrakenAdvancedGridStrategy:
                     else:
                         # Fallback to position info
                         entry_price = float(position['info'].get('price', current_price))
+
+                    # Update both position tracking systems
+                    self.active_positions[symbol] = {
+                        'info': {
+                            'price': entry_price,
+                            'size': position_size,
+                            'side': 'buy',
+                            'is_spot': is_spot
+                        }
+                    }
                     
                     self.positions[symbol] = {
                         'trailing_stop': None,
@@ -1587,12 +1560,13 @@ class KrakenAdvancedGridStrategy:
                     return
                 
             position_data = self.positions[symbol]
-            entry_price = position_data['entry_price']  # Changed from initial_entry_price to match
+            entry_price = position_data['entry_price']
             is_spot = position_data.get('is_spot', False)
             
             # Get mark price with validation
             try:
                 ticker = await self.exchange.fetch_ticker(symbol)
+                logger.debug(f"Raw ticker data: {ticker}")  # Add this line
                 if is_spot:
                     current_price = float(ticker['last'])  # Use last price for spot
                 else:
@@ -1668,19 +1642,14 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Stop Price: ${stop_price:.4f}")
                     logger.info(f"P&L: {profit_pct:.2f}%")
                     
-                    # Only execute if actually in loss
-                    if current_price < entry_price:
-                        logger.info("Confirming actual loss before stop")
-                        await self.execute_stop_loss(
-                            symbol=symbol,
-                            position_size=position_size,
-                            is_spot=is_spot,
-                            reason="stop loss"
-                        )
-                        return  # Add return here to handle the stop execution
-                    else:
-                        logger.info("Position in profit, skipping stop loss")
-                        return
+                    # Remove the redundant entry price check
+                    await self.execute_stop_loss(
+                        symbol=symbol,
+                        position_size=position_size,
+                        is_spot=is_spot,
+                        reason="stop loss"
+                    )
+                    return
                 
             except Exception as e:
                 logger.error(f"Error checking stop loss: {e}")
@@ -1886,7 +1855,8 @@ class KrakenAdvancedGridStrategy:
                 try:
                     balance = await self.exchange.fetch_balance()
                     asset = symbol.split('/')[0]
-                    spot_balance = float(balance.get(asset, {}).get('free', 0))
+                    spot_balance = float(balance.get(asset, {}).get('free', 0)) + \
+                                   float(balance.get(asset, {}).get('used', 0))
                     is_spot = spot_balance > 0  # Override is_spot based on actual balance
                     logger.info(f"\nVerified {asset} spot balance: {spot_balance}")
                 except Exception as e:
@@ -1995,183 +1965,118 @@ class KrakenAdvancedGridStrategy:
         return False
 
     async def monitor_positions(self, symbols: List[str] = None) -> None:
-        """Monitor and manage open positions with batch processing"""
+        """Monitor positions with accurate price tracking"""
         try:
-            # If no symbols provided, check all active positions
-            if not symbols:
-                symbols = list(self.active_positions.keys())
+            logger.info("\n=== MONITORING POSITIONS ===")
             
-            # Create batches of 4 symbols with 8 max workers
-            batch_size = 4  # Balanced batch size
-            max_workers = 8  # More conservative worker count
+            # Fetch actual positions from exchange
+            positions = await self.exchange.fetch_positions()
+            spot_balances = await self.exchange.fetch_balance()
             
-            async def process_symbol(symbol: str):
-                try:
-                    # Get mapped symbol from class attribute
-                    mapped_symbol = self.symbol_map.get(symbol)
-                    logger.info(f"Checking position for {symbol} (mapped: {mapped_symbol})")
-                    
-                    # Check both mapped and original symbol
-                    position = None
-                    if mapped_symbol in self.active_positions:
-                        position = self.active_positions[mapped_symbol]
-                        logger.info(f"Found position using mapped symbol: {mapped_symbol}")
-                    elif symbol in self.active_positions:
-                        position = self.active_positions[symbol]
-                        mapped_symbol = symbol
-                        logger.info(f"Found position using original symbol: {symbol}")
+            for symbol in (symbols or self.active_symbols):
+                # Spot positions
+                asset = symbol.split('/')[0]
+                spot_bal = float(spot_balances.get(asset, {}).get('free', 0))
+                if spot_bal > 0:
+                    # Calculate average entry price from order history
+                    orders = await self.exchange.fetch_orders(symbol, since=self.start_time)
+                    buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
+                    if buy_orders:
+                        total_cost = sum(o['filled'] * o['average'] for o in buy_orders)
+                        total_amount = sum(o['filled'] for o in buy_orders)
+                        avg_entry = total_cost / total_amount
                         
-                    if position:
-                        logger.error(f"\n{'='*50}")
-                        logger.error(f"MONITORING POSITION - {symbol}")
-                        logger.error(f"Size: {position['info'].get('size', 0)}")
-                        logger.error(f"Entry: {position['info'].get('price', 'N/A')}")
-                        logger.error(f"Side: {position['info'].get('side', 'N/A')}")
-                        logger.error(f"{'='*50}\n")
-                        
-                        # Get current price with proper error handling
-                        current_price = await self.get_current_price(symbol)
-                        if current_price is None:
-                            logger.error(f"Unable to get current price for {symbol}, skipping position monitoring")
-                            return
-                        
-                        # Calculate raw P&L first
+                        # Get current market price for stop loss calculations
                         try:
-                            entry_price = float(position['info']['price'])
-                            position_side = position['info']['side']
-                            position_size = float(position['info'].get('size', 0))
-                            
-                            raw_pnl_pct = (
-                                ((current_price - entry_price) / entry_price * 100)
-                                if position_side == 'long'
-                                else ((entry_price - current_price) / entry_price * 100)
-                            )
-                            
-                            # Calculate leveraged P&L for display
-                            leveraged_pnl = raw_pnl_pct * self.leverage
-                            
-                            # Log both raw and leveraged P&L
-                            logger.info(f"\nP&L Analysis for {symbol}:")
-                            logger.info(f"Entry: ${entry_price:.4f}")
-                            logger.info(f"Current: ${current_price:.4f}")
-                            logger.info(f"Raw P&L: {raw_pnl_pct:.2f}%")
-                            logger.info(f"Leveraged P&L: {leveraged_pnl:.2f}%")
-                            
-                            # QUICK PROFIT CHECK - Do this before manage_stop_loss
-                            if raw_pnl_pct >= 5.0:  # TP1 at 5%
-                                logger.info(f"🎯 Quick TP1 Check Triggered at {raw_pnl_pct:.2f}%")
-                                tp_size = position_size * 0.3
-                                tp_executed = await self.execute_take_profit(
-                                    symbol=symbol,
-                                    position_side=position_side,
-                                    size=tp_size,
-                                    price=current_price,
-                                    tp_type="TP1",
-                                    is_spot=True
-                                )
-                                if tp_executed:
-                                    return
-                            
-                            if raw_pnl_pct >= 10.0:  # TP2 at 10%
-                                logger.info(f"🎯 Quick TP2 Check Triggered at {raw_pnl_pct:.2f}%")
-                                tp_size = position_size * 0.3
-                                tp_executed = await self.execute_take_profit(
-                                    symbol=symbol,
-                                    position_side=position_side,
-                                    size=tp_size,
-                                    price=current_price,
-                                    tp_type="TP2",
-                                    is_spot=True
-                                )
-                                if tp_executed:
-                                    return
-                            
-                            # Continue with regular position management if no TPs executed
-                            await self.manage_stop_loss(symbol, position, current_price)
-                            
+                            ticker = await self.exchange.fetch_ticker(symbol)
+                            current_price = float(ticker['last'])
                         except Exception as e:
-                            logger.error(f"Error calculating P&L for {symbol}: {e}")
+                            logger.error(f"Price fetch error for {symbol}: {e}")
+                            continue
                         
-                    else:
-                        logger.info(f"No active position found for {symbol} ({mapped_symbol})")
+                        # Update both tracking systems with monitored entry price
+                        position_data = {
+                            'info': {
+                                'price': avg_entry,
+                                'size': spot_bal,
+                                'side': 'buy',
+                                'is_spot': True
+                            }
+                        }
+                        self.active_positions[symbol] = position_data
                         
-                except Exception as e:
-                    logger.error(f"Error processing symbol {symbol}: {e}")
-            
-            # Process symbols in batches with semaphore for max concurrency
-            semaphore = asyncio.Semaphore(max_workers)
-            
-            async def process_with_semaphore(symbol):
-                async with semaphore:
-                    await process_symbol(symbol)
-            
-            # Process batches
-            for i in range(0, len(symbols), batch_size):
-                batch = symbols[i:i + batch_size]
-                tasks = [process_with_semaphore(symbol) for symbol in batch]
-                await asyncio.gather(*tasks)
-                
+                        if symbol in self.positions:
+                            self.positions[symbol]['entry_price'] = avg_entry
+                        
+                        # Call stop loss management with live price
+                        await self.manage_stop_loss(
+                            symbol=symbol,
+                            position=position_data,
+                            current_price=current_price
+                        )
+                        
+                        logger.info(f"Active Spot Position: {symbol}")
+                        logger.info(f"Size: {spot_bal}")
+                        logger.info(f"Entry: {avg_entry:.5f}")
+                        logger.info(f"Current Price: {current_price:.5f}")
+
         except Exception as e:
-            logger.error(f"Error in batch position monitoring: {e}")
+            logger.error(f"Error monitoring positions: {e}")
 
     async def start(self):
-        while True:  # Add this outer loop
+        while True:  # Outer loop for strategy restart
             try:
-                # Add a new flag to track if we have sufficient funds
-                self.has_sufficient_funds = True
-                
-                logger.info("Starting grid trading strategy...")
-                
-                # Initialize symbol mappings
-                self.symbol_map = {
-                    'PF_XBTUSD': 'BTC/USD:USD',
-                    'PF_XRPUSD': 'XRP/USD:USD',
-                    'PI_ETHUSD': 'ETH/USD:ETH',
-                    'PF_DOGEUSD': 'DOGE/USD:USD',
-                    'PF_LDOUSD': 'LDO/USD:USD',
-                    'PF_ADAUSD': 'ADA/USD:USD',
-                    'PF_MATICUSD': 'MATIC/USD:USD',
-                    'PF_FILUSD': 'FIL/USD:USD',
-                    'PF_APEUSD': 'APE/USD:USD',
-                    'PF_GMXUSD': 'GMX/USD:USD',
-                    'PF_BATUSD': 'BAT/USD:USD',
-                    'PF_XLMUSD': 'XLM/USD:USD',
-                    'PF_EOSUSD': 'EOS/USD:USD',
-                    'PF_OPUSD': 'OP/USD:USD',
-                    'PF_AAVEUSD': 'AAVE/USD:USD',
-                    'PF_LINKUSD': 'LINK/USD:USD',
-                    'PF_XMRUSD': 'XMR/USD:USD',
-                    'PF_ATOMUSD': 'ATOM/USD:USD',
-                    'PF_DOTUSD': 'DOT/USD:USD',
-                    'PF_ALGOUSD': 'ALGO/USD:USD',
-                    'PF_TRXUSD': 'TRX/USD:USD',
-                    'PF_SOLUSD': 'SOL/USD:USD',
-                    'PF_AVAXUSD': 'AVAX/USD:USD',
-                    'PF_UNIUSD': 'UNI/USD:USD',
-                    'PF_SNXUSD': 'SNX/USD:USD',
-                    'PF_NEARUSD': 'NEAR/USD:USD',
-                    'PF_FTMUSD': 'FTM/USD:USD',
-                    'PF_ARBUSD': 'ARB/USD:USD',
-                    'PF_COMPUSD': 'COMP/USD:USD',
-                    'PF_YFIUSD': 'YFI/USD:USD'
-                }
-                self.reverse_symbol_map = {v: k for k, v in self.symbol_map.items()}
-                
-                # Initialize tracking dictionaries
+                # Initialize tracking dictionaries ONCE
                 self.positions = {}
                 self.last_grid_check = {}
                 self.active_positions = {}
+                
+                # Initialize symbol mappings
+                self.symbol_map = {
+                    'PF_XBTUSD': 'BTC/USD',
+                    'PF_XRPUSD': 'XRP/USD',
+                    'PI_ETHUSD': 'ETH/USD',
+                    'PF_DOGEUSD': 'DOGE/USD',
+                    'PF_LDOUSD': 'LDO/USD',
+                    'PF_ADAUSD': 'ADA/USD',
+                    'PF_MATICUSD': 'MATIC/USD',
+                    'PF_FILUSD': 'FIL/USD',
+                    'PF_APEUSD': 'APE/USD',
+                    'PF_GMXUSD': 'GMX/USD',
+                    'PF_BATUSD': 'BAT/USD',
+                    'PF_XLMUSD': 'XLM/USD',
+
+                    'PF_EOSUSD': 'EOS/USD',
+                    'PF_OPUSD': 'OP/USD',
+                    'PF_AAVEUSD': 'AAVE/USD',
+                    'PF_LINKUSD': 'LINK/USD',
+                    'PF_XMRUSD': 'XMR/USD',
+                    'PF_ATOMUSD': 'ATOM/USD',
+                    'PF_DOTUSD': 'DOT/USD',
+
+                    'PF_ALGOUSD': 'ALGO/USD',
+                    'PF_TRXUSD': 'TRX/USD',
+                    'PF_SOLUSD': 'SOL/USD',
+                    'PF_AVAXUSD': 'AVAX/USD',
+                    'PF_UNIUSD': 'UNI/USD',
+                    'PF_SNXUSD': 'SNX/USD',
+
+                    'PF_NEARUSD': 'NEAR/USD',
+                    'PF_FTMUSD': 'FTM/USD',
+                    'PF_ARBUSD': 'ARB/USD',
+                    'PF_COMPUSD': 'COMP/USD',
+                    'PF_YFIUSD': 'YFI/USD'
+                }
+                self.reverse_symbol_map = {v: k for k, v in self.symbol_map.items()}
                 
                 # Retry loop for exchange connection
                 retry_count = 0
                 while retry_count < 5:
                     try:
-                        # Get initial balance
-                        self.last_balance = await self.get_account_balance()
-                        logger.info(f"Initial balance: {self.last_balance}")
-                        
-                        # Verify spot positions
+                        # Get initial balance and verify positions
                         balance = await self.exchange.fetch_balance()
+                        
+                        # Verify spot positions and initialize tracking
                         for symbol in self.symbol_map.values():
                             asset = symbol.split('/')[0]
                             spot_balance = float(balance.get(asset, {}).get('free', 0))
@@ -2186,33 +2091,37 @@ class KrakenAdvancedGridStrategy:
                                 try:
                                     orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
                                     buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
-                                    entry_price = float(buy_orders[0]['price']) if buy_orders else None
+                                    if buy_orders:
+                                        entry_price = float(buy_orders[0]['price'])
+                                        # Update both tracking systems
+                                        self.active_positions[symbol] = {
+                                            'info': {
+                                                'price': entry_price,
+                                                'size': spot_balance,
+                                                'side': 'buy',
+                                                'is_spot': True
+                                            }
+                                        }
+                                        
+                                        self.positions[symbol] = {
+                                            'entry_price': entry_price,
+                                            'position_size': spot_balance,
+                                            'side': 'buy',
+                                            'trailing_stop': None,
+                                            'tp1_triggered': False,
+                                            'tp2_triggered': False,
+                                            'breakeven_triggered': False,
+                                            'trailing_active': False,
+                                            'is_spot': True,
+                                            'stop_buffer': 0.02
+                                        }
+                                        logger.info(f"Initialized position tracking for {symbol} at ${entry_price}")
                                 except Exception as e:
-                                    logger.error(f"Error getting entry price: {e}")
-                                    entry_price = None
-                                
-                                if entry_price:
-                                    logger.error(f"Entry Price: ${entry_price}")
-                                    # Initialize position tracking
-                                    self.positions[symbol] = {
-                                        'entry_price': entry_price,
-                                        'position_size': spot_balance,
-                                        'side': 'buy',
-                                        'trailing_stop': None,
-                                        'tp1_triggered': False,
-                                        'tp2_triggered': False,
-                                        'breakeven_triggered': False,
-                                        'trailing_active': False,
-                                        'is_spot': True,
-                                        'stop_buffer': 0.02
-                                    }
-                                logger.error(f"{'='*50}\n")
-                        
-                        # Get initial positions
-                        positions = await self.verify_actual_positions() or []
-                        logger.info(f"Found {len(positions)} positions on startup")
+                                    logger.error(f"Error initializing {symbol}: {e}")
+                                    continue
                         
                         break  # Break retry loop on success
+                        
                     except ccxt.RequestTimeout:
                         retry_count += 1
                         logger.warning(f"Timeout connecting to exchange. Retry {retry_count}/5")
@@ -2235,14 +2144,46 @@ class KrakenAdvancedGridStrategy:
                     try:
                         current_time = time.time()
                         
-                        # Get fresh positions data
-                        positions = await self.get_open_positions()
-                        self.active_positions = {p['symbol']: p for p in positions}
-                        
-                        # Monitor existing positions
+                        # Monitor positions first
                         logger.info("\n=== MONITORING ACTIVE POSITIONS ===")
-                        if self.active_positions:
-                            await self.monitor_positions()  # Will now process all positions in batches
+                        
+                        # Get both spot and futures positions
+                        positions = await self.verify_actual_positions()
+                        
+                        # Update active positions
+                        for pos in positions:
+                            symbol = pos['symbol']
+                            if symbol not in self.active_positions:
+                                # Get entry price from order history
+                                try:
+                                    orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
+                                    buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
+                                    if buy_orders:
+                                        entry_price = float(buy_orders[0]['price'])
+                                    else:
+                                        entry_price = float(pos['info']['price'])
+                                        
+                                    self.active_positions[symbol] = {
+                                        'info': {
+                                            'price': entry_price,
+                                            'size': float(pos['info']['size']),
+                                            'side': 'buy',
+                                            'is_spot': True
+                                        }
+                                    }
+                                    logger.info(f"Found position: {symbol}")
+                                    logger.info(f"Size: {pos['info']['size']}")
+                                    logger.info(f"Entry: {entry_price}")
+                                except Exception as e:
+                                    logger.error(f"Error initializing position for {symbol}: {e}")
+                            else:
+                                # Position already tracked
+                                logger.info(f"Monitoring position: {symbol}")
+                                logger.info(f"Size: {self.active_positions[symbol]['info']['size']}")
+                                logger.info(f"Entry: {self.active_positions[symbol]['info']['price']}")
+                        
+                        if not self.active_positions:
+                            logger.info("No active positions to monitor")
                         logger.info("=== FINISHED POSITION MONITORING ===\n")
                         
                         # Update and process trading symbols
@@ -2290,39 +2231,59 @@ class KrakenAdvancedGridStrategy:
                     pass
 
     async def background_market_scan(self):
-        """Background task to scan and update available markets"""
+        """Enhanced scanner that finds candidates for filtering"""
         try:
-            while True:
-                logger.info("Running background market scan...")
-                
-                # Only scan for new symbols if we have sufficient funds
-                if self.has_sufficient_funds:
-                    # Update available symbols based on balance
-                    available_balance = await self.get_available_balance()
-                    
-                    new_symbols = ['BTC/USD:USD', 'ETH/USD:ETH', 'SOL/USD:USD']  # Base tier
-                    
-                    if available_balance >= 500:
-                        new_symbols.extend(['ATOM/USD:USD', 'LINK/USD:USD'])
-                    if available_balance >= 2000:
-                        new_symbols.extend(['AAVE/USD:USD', 'UNI/USD:USD'])
-                    if available_balance >= 5000:
-                        new_symbols.extend(['DOT/USD:USD', 'AVAX/USD:USD'])
-                        
-                    # Update active symbols
-                    self.active_symbols = list(set(new_symbols))
-                    logger.info(f"Updated active symbols: {self.active_symbols}")
-                else:
-                    # Only track symbols with active positions
-                    self.active_symbols = list(self.active_positions.keys())
-                    logger.info(f"Insufficient funds - Only monitoring active positions: {self.active_symbols}")
-                
-                await asyncio.sleep(3600)  # Scan every hour
-                
+            # Get all available symbols from exchange
+            all_markets = await self.exchange.fetch_markets()
+            all_symbols = [m['symbol'] for m in all_markets if m['active']]
+            
+            # Scan for symbols meeting basic conditions
+            scan_tasks = [
+                self._scan_symbol(sym) 
+                for sym in all_symbols[:50]  # Scan top 50 by default
+            ]
+            candidates = await asyncio.gather(*scan_tasks)
+            valid_candidates = [sym for sym in candidates if sym]
+            
+            # Pass candidates through full filtering
+            self.active_symbols = await self.filter_symbols(valid_candidates)
+            
+            logger.info(f"Updated trading symbols: {self.active_symbols}")
+
         except asyncio.CancelledError:
             logger.info("Background market scanner stopped")
         except Exception as e:
             logger.error(f"Error in background market scanner: {e}")
+
+    async def _scan_symbol(self, symbol: str) -> Union[str, None]:
+        """Market scanner pre-filter using analyzer conditions"""
+        try:
+            # Add USD pair check
+            if not symbol.upper().endswith('/USD'):
+                logger.debug(f"Skipping non-USD pair: {symbol}")
+                return None
+                
+            # Get recent data for analysis
+            df = await self.get_historical_data(symbol, '4h', 50)
+            if df is None or len(df) < 20:
+                return None
+                
+            # Check analyzer conditions
+            if not self.market_analyzer.check_volatility(df):
+                return None
+                
+            if not self.market_analyzer.check_trend_strength(df):
+                return None
+                
+            if (datetime.now() - pd.to_datetime(df.index[-1])).seconds > 3600:
+                logger.warning(f"Stale data for {symbol}")
+                return None
+                
+            return symbol
+                
+        except Exception as e:
+            logger.error(f"Scan failed for {symbol}: {e}")
+            return None
 
     async def verify_stop_orders(self, symbol: str, position: dict) -> None:
         try:
@@ -2482,13 +2443,19 @@ class KrakenAdvancedGridStrategy:
                     tf_df['ema200'] = talib.EMA(tf_df['close'], timeperiod=200)
                     
                     # RSI
-                    tf_df['rsi'] = ta.momentum.RSIIndicator(tf_df['close'], window=14).rsi()
+                    tf_df['rsi'] = talib.RSI(tf_df['close'], timeperiod=14)
                     
+
                     # MACD
-                    macd = ta.trend.MACD(tf_df['close'])
-                    tf_df['macd'] = macd.macd()
-                    tf_df['macd_signal'] = macd.macd_signal()
-                    tf_df['macd_hist'] = macd.macd_diff()
+                    macd_line, signal_line, macd_hist = talib.MACD(
+                        tf_df['close'], 
+                        fastperiod=self.macd_fast,  # Correct parameter name
+                        slowperiod=self.macd_slow,   # Correct parameter name
+                        signalperiod=self.macd_signal
+                    )
+                    tf_df['macd'] = macd_line
+                    tf_df['macd_signal'] = signal_line
+                    tf_df['macd_hist'] = macd_hist
                     
                     tech_scores[tf] = {
                         'rsi': tf_df['rsi'].iloc[-1],
@@ -2741,10 +2708,11 @@ class KrakenAdvancedGridStrategy:
                 # Update active positions based on actual spot balances
                 self.active_positions = {
                     symbol: {
-                        'symbol': symbol,
-                        'size': spot_balance,
-                        'entry_price': entry_price,
-                        'is_spot': True
+                        'info': {
+                            'price': entry_price,
+                            'size': spot_balance,
+                            'side': 'buy'
+                        }
                     }
                 }
                 
@@ -3071,18 +3039,19 @@ class KrakenAdvancedGridStrategy:
                     df[f'ema_{emas["slow_ema"]}'] = df['close'].ewm(span=emas['slow_ema'], adjust=False).mean()
                     
                     # Add RSI
-                    df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
+                    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
                     
+
                     # Add MACD
-                    macd = ta.trend.MACD(
+                    macd_line, signal_line, macd_hist = talib.MACD(
                         df['close'], 
-                        window_slow=self.macd_slow, 
-                        window_fast=self.macd_fast, 
-                        window_sign=self.macd_signal
+                        fastperiod=self.macd_fast, 
+                        slowperiod=self.macd_slow,   
+                        signalperiod=self.macd_signal
                     )
-                    df['macd'] = macd.macd()
-                    df['macd_signal'] = macd.macd_signal()
-                    df['macd_histogram'] = macd.macd_diff()
+                    df['macd'] = macd_line
+                    df['macd_signal'] = signal_line
+                    df['macd_histogram'] = macd_hist
                     
                     # Get S/R levels with Fibonacci
                     support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
@@ -3268,285 +3237,540 @@ class KrakenAdvancedGridStrategy:
             return False, 0.0
 
     async def filter_symbols(self, symbols: List[str]) -> List[str]:
-        """Pre-filter symbols before detailed analysis - rescans hourly"""
-        filtered = []
-        current_time = time.time()
-        
-        # Check if an hour has passed since last scan
-        if hasattr(self, 'last_scan_time') and current_time - self.last_scan_time < 3600:
-            logger.info("Using existing filtered symbols (next scan in {:.1f} minutes)".format(
-                (3600 - (current_time - self.last_scan_time)) / 60
-            ))
-            return self.last_filtered_symbols if hasattr(self, 'last_filtered_symbols') else []
-        
-        logger.info(f"\n{'='*50}")
-        logger.info(f"🔍 HOURLY SYMBOL SCAN - PRE-FILTERING {len(symbols)} SYMBOLS")
-        logger.info(f"{'='*50}")
-        
-        # Get available balance first
-        available_balance = await self.get_available_balance()  # Changed from get_account_balance
-        logger.info(f"Available Balance: ${available_balance:.2f}")
-        
-        # Calculate max position size (e.g., 20% of account)
-        max_position_size = available_balance * 0.20
-        logger.info(f"Max Position Size: ${max_position_size:.2f}")
-        
-        # Restricted pairs for US/TX
-        restricted_pairs = [
-            'EUR', 'GBP', 'CHF', 'AUD', 'CAD', 'JPY',  # Fiat pairs
-            'USDC', 'USDT', 'DAI', 'BUSD'  # Stablecoins
-        ]
-        
+        """Market-analyzer enhanced symbol filtering"""
         try:
-            # Get all tickers at once for efficiency
-            tickers = await self.exchange.fetch_tickers()
+            # Stage 0: Remove blacklisted symbols
+            filtered = [s for s in symbols if s not in self.STABLE_BLACKLIST]
             
-            # Filter and sort by volume, considering account size
-            tradeable_symbols = []
-            for symbol in symbols:
-                try:
-                    if (symbol in tickers and 
-                        tickers[symbol]['quoteVolume'] is not None and 
-                        not any(restricted in symbol for restricted in restricted_pairs)):
-                        
-                        ticker = tickers[symbol]
-                        price = ticker['last']
-                        
-                        # Calculate minimum position size (e.g., 3 units)
-                        min_position_cost = price * 3  # Minimum 3 units
-                        
-                        # Check if we can trade at least 3 units and price is reasonable
-                        if (min_position_cost <= max_position_size and 
-                            ticker['quoteVolume'] > 1000000 and  # Min 1M daily volume
-                            'USD' in symbol):
-                            
-                            tradeable_symbols.append({
-                                'symbol': symbol,
-                                'price': price,
-                                'volume': ticker['quoteVolume'],
-                                'min_cost': min_position_cost
-                            })
-                            
-                except Exception as e:
-                    continue
+            # Stage 1: Liquidity filter (lines 3361-3371)
+            liquidity_filtered = await self._quick_liquidity_filter(filtered)
             
-            # Sort by volume and filter top symbols
-            volume_sorted = sorted(
-                tradeable_symbols,
-                key=lambda x: x['volume'],
+            # Stage 2: Parallel market analysis (new)
+            analysis_tasks = [
+                self._analyze_symbol(sym)
+                for sym in liquidity_filtered[:20]  # Analyze top 20
+            ]
+            results = await asyncio.gather(*analysis_tasks)
+            
+            # Stage 3: Scoring and sorting with dynamic threshold
+            sorted_symbols = sorted(
+                [(sym, score) for sym, score in results if score is not None],
+                key=lambda x: x[1],
                 reverse=True
-            )[:20]  # Take top 20
+            )
             
-            # Log detailed analysis
-            logger.info("\nTradeable Symbols Analysis:")
-            logger.info(f"{'Symbol':<12} {'Price':<10} {'Volume(M)':<12} {'Min Cost':<10}")
-            logger.info("-" * 44)
-            
-            for item in volume_sorted:
-                filtered.append(item['symbol'])
-                logger.info(
-                    f"{item['symbol']:<12} "
-                    f"${item['price']:<9.2f} "
-                    f"${item['volume']/1000000:<11.1f}M "
-                    f"${item['min_cost']:<9.2f}"
-                )
-            
-            # Store scan time and filtered symbols
-            self.last_scan_time = current_time
-            self.last_filtered_symbols = filtered
-            
-            logger.info(f"\n✨ Selected {len(filtered)} symbols within account trading range")
-            logger.info(f"Account size: ${available_balance:.2f}")
-            logger.info(f"Max position: ${max_position_size:.2f}")
-            logger.info("Next scan in 60 minutes")
-            return filtered
-            
+            # Get top 10% or minimum 3 symbols
+            top_count = max(3, int(len(sorted_symbols) * 0.1))
+            return [sym for sym, _ in sorted_symbols[:top_count]]
+        
         except Exception as e:
-            logger.error(f"Error in filter_symbols: {e}")
-            # Return major pairs that are likely within our range
-            return ['XRP/USD', 'ADA/USD', 'DOGE/USD', 'DOT/USD']  # Lower-priced majors as fallback
+            logger.error(f"Filter error: {e}")
+            return []
 
-    def normalize_symbol(self, symbol: str) -> str:
-        """Normalize symbol format for Kraken"""
+    async def _analyze_symbol(self, symbol: str) -> Tuple[str, float]:
+        """Market analyzer-powered symbol validation"""
         try:
-            # Remove any suffixes like :USD or :ETH
-            base_symbol = symbol.split(':')[0]
-            
-            # Map of common symbol corrections
-            symbol_map = {
-                'BTC/USD': 'BTC/USD',  # Kraken uses XBT instead of BTC
-                'WBTC/USD': 'WBTC/USD',
-                'ETH/USD': 'ETH/USD',
-                'SOL/USD': 'SOL/USD',
-                'XRP/USD': 'XRP/USD',
-                'ADA/USD': 'ADA/USD',
-                'DOGE/USD': 'DOGE/USD',
-                'DOT/USD': 'DOT/USD',
-                'LTC/USD': 'LTC/USD'
+            # Get multi-timeframe data (lines 3390-3393)
+            df = await self.get_historical_data(symbol, '4h', limit=100)
+            if df is None or len(df) < 50:
+                return symbol, 0.0
+
+            # Get analyzer scores (lines 460-472, 513-515)
+            price_data = {
+                'timeframe': '4h',
+                'price_data': {
+                    'open': df['open'].tolist(),
+                    'high': df['high'].tolist(),
+                    'low': df['low'].tolist(),
+                    'close': df['close'].tolist()
+                }
             }
             
-            normalized = symbol_map.get(base_symbol, base_symbol)
-            logger.info(f"Normalized {symbol} to {normalized}")
-            return normalized
+            sentiment_score = await self.market_analyzer.get_market_sentiment(price_data, symbol)
+            tech_signals = self.market_analyzer.calculate_signals(df)
+            
+            # Composite score (lines 537-543)
+            confidence = (sentiment_score + tech_signals['signal_strength']) * 5  # Scale 0-10
+            logger.info(f"Symbol {symbol} score: Sentiment {sentiment_score:.2f}, Tech {tech_signals['signal_strength']:.2f} → {confidence:.2f}")
+            
+            if self.is_weekend():
+                confidence *= 1.2  # 20% weekend volatility bonus
+                logger.info(f"Weekend adjustment → {confidence:.2f}")
+            
+            return symbol, confidence
             
         except Exception as e:
-            logger.error(f"Error normalizing symbol {symbol}: {e}")
-            return symbol  # Return original if normalization fails
+            logger.error(f"Analysis failed for {symbol}: {e}")
+            return symbol, 0.0
 
-    async def execute_stop_loss(self, symbol: str, position_size: float, is_spot: bool, reason: str = "stop loss") -> bool:
-        """Execute stop loss order with retries and confirmation"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # Verify spot balance first
-                balance = await self.exchange.fetch_balance()
-                asset = symbol.split('/')[0]
-                spot_balance = float(balance.get(asset, {}).get('free', 0))
-                
-                if spot_balance <= 0:
-                    logger.error(f"No spot balance found for {asset}, cleaning up tracking")
-                    if symbol in self.positions:
-                        del self.positions[symbol]
-                    if symbol in self.active_positions:
-                        del self.active_positions[symbol]
-                    return True  # Return True since position is already closed
-                
-                logger.error(f"\n{'='*50}")
-                logger.error(f"🚨 EXECUTING {reason.upper()} - Attempt {attempt + 1}/{max_retries}")
-                logger.error(f"Symbol: {symbol}")
-                logger.error(f"Actual Balance: {spot_balance} {asset}")
-                
-                # Use actual spot balance for order
-                params = {
-                    'ordertype': 'market',
-                    'trading_agreement': 'agree'
-                }
-                
-                order = await self.exchange.create_market_order(
-                    symbol=symbol,
-                    side='sell',
-                    amount=spot_balance,
-                    params=params
-                )
-                
-                if order and 'id' in order:
-                    logger.error(f"✅ {reason.upper()} executed successfully")
-                    logger.error(f"Order ID: {order['id']}")
-                    logger.error(f"Size: {spot_balance}")
-                    logger.error(f"{'='*50}\n")
-                    
-                    # Clean up position tracking
-                    if symbol in self.positions:
-                        del self.positions[symbol]
-                    if symbol in self.active_positions:
-                        del self.active_positions[symbol]
-                    return True
-                
-                logger.error(f"❌ No order ID returned - Attempt {attempt + 1}")
-                await asyncio.sleep(1)
-                
-            except Exception as e:
-                logger.error(f"❌ Error executing {reason}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)
-                continue
+    async def _quick_liquidity_filter(self, symbols):
+        """Fast pre-filter based on volume and balance"""
+        balance = await self.get_account_balance()
+        max_size = balance * 0.2
         
-        logger.error(f"❌ Failed to execute {reason} after {max_retries} attempts")
-        return False
-
-    async def validate_order_size(self, symbol: str, amount: float) -> bool:
-        """Always validate order size as true to allow any size orders"""
-        try:
-            logger.info(f"Allowing order for {symbol} with size {amount}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error in order size validation: {e}")
-            return True  # Still return True on error to allow order
-
-    async def validate_grid_order_size(self, symbol: str, size: float) -> float:
-        """Validate if grid order size meets exchange minimums"""
-        try:
-            # Get market info from exchange
-            market = self.exchange.market(symbol)
-            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
-            
-            if size < min_amount:
-                logger.warning(f"Grid order size {size} is below minimum {min_amount} for {symbol}")
-                # Calculate the adjusted size to meet minimum
-                adjusted_size = min_amount * 1.01  # Add 1% buffer
-                logger.info(f"Adjusting grid order size to {adjusted_size}")
-                return adjusted_size
-                
-            return size
-            
-        except Exception as e:
-            logger.error(f"Error validating grid order size: {e}")
-            return size  # Return original size if validation fails
-
-    async def verify_actual_positions(self) -> List[Dict]:
-        """Verify actual positions vs open orders"""
-        try:
-            # Get actual balances
-            balance = await self.exchange.fetch_balance()
-            
-            # Track actual positions
-            actual_positions = []
-            
-            for currency, amount in balance.get('free', {}).items():
-                if currency in ['USD', 'USDT']:
-                    continue
-                
-                total_amount = float(amount)
-                if total_amount > 0.00001:  # Minimum threshold
-                    symbol = f"{currency}/USD"
-                    
-                    # Get actual entry price from order history
-                    orders = await self.exchange.fetch_closed_orders(symbol)
-                    filled_buys = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
-                    
-                    if filled_buys:
-                        entry_price = float(filled_buys[0]['price'])
-                        logger.info(f"Found actual position for {symbol}:")
-                        logger.info(f"Balance: {total_amount} {currency}")
-                        logger.info(f"Entry: ${entry_price}")
-                        
-                        position = {
-                            'symbol': symbol,
-                            'info': {
-                                'symbol': symbol,
-                                'size': total_amount,
-                                'price': entry_price,
-                                'side': 'long',
-                                'is_spot': True
-                            }
-                        }
-                        actual_positions.append(position)
-            
-            return actual_positions
-                
-        except Exception as e:
-            logger.error(f"Error verifying actual positions: {e}")
-            return []  # Return empty list on error
+        tickers = await self.exchange.fetch_tickers()
+        return [
+            sym for sym in symbols
+            if tickers.get(sym, {}).get('quoteVolume', 0) > 1_000_000
+            and tickers[sym]['last'] * 3 <= max_size
+        ]
 
     async def validate_entry_conditions(self, symbol: str, df: pd.DataFrame) -> bool:
-        """Enhanced multi-timeframe entry validation"""
+        """Optimized entry validation with parallel technical analysis"""
         try:
-            # Get multi-timeframe data
-            daily_df = await self.get_historical_data(symbol, timeframe='1d')
-            four_hour_df = await self.get_historical_data(symbol, timeframe='4h')
-            hourly_df = await self.get_historical_data(symbol, timeframe='1h')
-            five_min_df = df  # Current 5m dataframe
+            # Validate input DataFrame
+            if df is None or len(df) < self.atr_periods:
+                logger.warning(f"Insufficient data for {symbol}")
+                return False
 
-            # Add sentiment analysis
-            sentiment_data = await self.market_analyzer.analyze_market_sentiment(symbol, '1d')
-            if sentiment_data and sentiment_data.get('confidence', 0) > 0.8:
-                sentiment_score = sentiment_data['sentiment']['positive']
+            # Calculate position size first
+            size = await self.calculate_position_size(symbol)
+            if size <= 0:
+                logger.warning(f"Skipping {symbol} - invalid size")
+                return False
+
+            # Batch load multi-timeframe data with validation
+            timeframes = ['1d', '4h', '1h', '5m']
+            dfs = await asyncio.gather(
+                *[self.get_historical_data(symbol, tf) for tf in timeframes],
+                return_exceptions=True
+            )
+            
+            # Check for exceptions in timeframe data
+            if any(isinstance(d, Exception) for d in dfs):
+                logger.error(f"Error fetching timeframe data for {symbol}")
+                return False
+                
+            daily_df, four_hour_df, hourly_df, five_min_df = dfs
+            
+            # Validate all timeframes have sufficient data and required columns
+            if any(d is None or len(d) < self.atr_periods or not {'open','high','low','close'}.issubset(d.columns) 
+                   for d in [daily_df, four_hour_df, hourly_df, five_min_df]):
+                logger.warning(f"Insufficient multi-timeframe data for {symbol}")
+                return False
+
+            # Parallel technical analysis with error handling
+            try:
+                analysis_tasks = [
+                    self._analyze_daily(daily_df, symbol),
+                    self._analyze_4h(four_hour_df, symbol),
+                    self._analyze_1h(hourly_df, symbol),
+                    self._analyze_5m(five_min_df, symbol)
+                ]
+                results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+
+                # Check for exceptions in results
+                if any(isinstance(r, Exception) for r in results):
+                    logger.error(f"Analysis error in timeframe analysis")
+                    return False
+                
+                daily_ok, fourh_ok, hour_ok, five_min_ok = results
+                
+            except Exception as e:
+                logger.error(f"Technical analysis error: {e}")
+                return False
+
+            # Combined validation
+            if not all([daily_ok, fourh_ok, hour_ok, five_min_ok]):
+                return False
+
+            # Batch sentiment check with validation
+            if len(daily_df) > 0:  # Make sure we have data
+                # Validate OHLC columns exist in daily data
+                if not all(col in daily_df.columns for col in ['open', 'high', 'low', 'close']):
+                    logger.error(f"Missing OHLC columns in daily data for {symbol}")
+                    return False
+                
+                sentiment_params = {
+                    'timeframe': '1d',
+                    'price_data': {
+                        'open': daily_df['open'].astype(float).tolist(),
+                        'high': daily_df['high'].astype(float).tolist(),
+                        'low': daily_df['low'].astype(float).tolist(),
+                        'close': daily_df['close'].astype(float).tolist()
+                    }
+                }
+                try:
+                    sentiment_score = await self.market_analyzer.get_market_sentiment(sentiment_params, symbol)
+                    if sentiment_score < 0.6:
+                        logger.info(f"❌ Insufficient sentiment score: {sentiment_score:.2f}")
+                        return False
+                except Exception as e:
+                    logger.error(f"Sentiment analysis error: {e}")
+                    return False
+            else:
+                logger.warning("Insufficient data for sentiment analysis")
+                return False
+
+            # New volatility check ===============
+            try:
+                current_price = float(df['close'].iloc[-1])
+                volatility = await self.get_asset_volatility(symbol)
+                
+                if volatility >= 0.6:  # 60% volatility threshold
+                    logger.info(f"❌ Volatility too high: {volatility*100:.2f}%")
+                    return False
+                logger.info(f"✅ Acceptable volatility: {volatility*100:.2f}%")
+            except Exception as e:
+                logger.error(f"Volatility check failed: {e}")
+                return False
+
+            # Add bear market bounce check here 
+            market_state = "bull" if daily_df['close'].iloc[-1] > daily_df['close'].iloc[-200] else "bear"
+            if market_state == "bear":
+                if not await self.detect_bear_bounce(five_min_df):
+                    logger.info("❌ No bear market bounce detected")
+                    return False
+
+            # Final price structure check with validation
+            try:
+                if len(df['close']) == 0:
+                    logger.error("Empty price data")
+                    return False
+                    
+                current_price = float(df['close'].iloc[-1])
+                resistance_check = await self._check_resistance_levels(symbol, current_price)
+                
+                # Position validation - only if position exists
+                if symbol in self.positions:
+                    position = self.positions[symbol]
+                    if isinstance(position, dict):
+                        entry_price = position.get('entry_price')
+                        if entry_price is None:
+                            logger.warning(f"No entry price found for existing position in {symbol}")
+                    else:
+                        logger.warning(f"Invalid position data format for {symbol}")
+                
+                return resistance_check
+                
+            except Exception as e:
+                logger.error(f"Price structure check error: {e}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Validation error for {symbol}: {e}")
+            return False
+
+    async def _analyze_daily(self, df: pd.DataFrame, symbol: str) -> bool:
+        """Enhanced daily analysis with reversal confirmation"""
+        try:
+            # Existing swing/EMA analysis
+            support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
+            
+            # Get current price from the existing pattern
+            current_price = float(df['close'].iloc[-1])
+            
+            # Add 200 EMA trend check
+            ema200 = talib.EMA(df['close'], 200).iloc[-1]
+            price_above_ema200 = current_price > ema200
+            
+            # Determine market state (matches line 3507-3515)
+            market_state = "bull" if price_above_ema200 else "bear"
+            
+            logger.info(f"200 EMA: {ema200:.4f}")
+            logger.info(f"Market State: {market_state.upper()} | Price vs 200 EMA: {'✅ Above' if price_above_ema200 else '❌ Below'}")
+            
+            # New reversal indicators
+            rsi = talib.RSI(df['close'], 14).iloc[-1]
+            rsi_prev = talib.RSI(df['close'], 14).iloc[-2]
+            macd_line, signal_line, _ = talib.MACD(df['close'])
+            
+
+            # Dynamic criteria based on market state
+            rsi_threshold = 30 if market_state == "bull" else 25
+            volume_multiplier = 1.25 if market_state == "bull" else 1.1
+            
+            # Bullish reversal criteria
+            rsi_bullish = (rsi > rsi_threshold) and (rsi_prev <= rsi_threshold)
+            macd_bullish = (macd_line.iloc[-1] > signal_line.iloc[-1]) and \
+                          (macd_line.iloc[-2] <= signal_line.iloc[-2])
+            
+            logger.info(f"Daily Reversal Checks:")
+            logger.info(f"RSI Cross >{rsi_threshold}: {'✅' if rsi_bullish else '❌'} ({rsi_prev:.1f} → {rsi:.1f})")
+            logger.info(f"MACD Bull Cross: {'✅' if macd_bullish else '❌'}")
+
+            # ATR validation with market-based ranges
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            atr_pct = (atr / current_price) * 100
+            atr_min, atr_max = (2.0, 4.0) if market_state == "bear" else (1.5, 5.0)
+            
+
+            logger.info(f"Daily ATR: {atr_pct:.1f}%")
+            
+            if not (atr_min <= atr_pct <= atr_max):
+                logger.info(f"❌ Daily ATR out of {market_state} range ({atr_min}-{atr_max}%): {atr_pct:.1f}%")
+                return False
+
+            # Volume validation with dynamic multiplier
+            volume = df['volume'].iloc[-1]
+            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
+            strong_volume = volume > vol_ma * volume_multiplier
+            
+            logger.info(f"Volume Check: {volume:,.2f} vs MA {vol_ma:,.2f}")
+            logger.info(f"Volume Strength: {'✅' if strong_volume else '❌'} (Req: {volume_multiplier}x)")
+            
+            # Combined validation with market-specific rules
+            return (
+                (price_above_ema200 if market_state == "bull" else True) and
+                self._ema_bullish_cross(df) and
+                (rsi_bullish or macd_bullish) and
+                strong_volume and
+                (await self._price_position_checks(current_price, support_levels, resistance_levels))
+            )
+            
+        except Exception as e:
+            logger.error(f"Daily analysis error: {e}")
+            return False
+
+    def _ema_bullish_cross(self, df: pd.DataFrame) -> bool:
+        """Existing EMA cross check from line 3447-3466"""
+        df['ema9'] = talib.EMA(df['close'], timeperiod=9)
+        df['ema21'] = talib.EMA(df['close'], timeperiod=21)
+        current_cross = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
+        previous_cross = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
+        return current_cross and previous_cross
+
+
+    async def _analyze_4h(self, df: pd.DataFrame, symbol: str) -> bool:
+        """4-hour trend analysis - Relaxed Version"""
+        try:
+            # Simplified EMA Structure
+            df['ema9'] = talib.EMA(df['close'], 9)
+            
+            # Price Relationships (keep basic trend check)
+            price_above_ema9 = df['close'].iloc[-1] > df['ema9'].iloc[-1]
+            
+            # Momentum Indicators (keep core requirements)
+            macd_line, signal_line, _ = talib.MACD(df['close'])
+            histogram = macd_line - signal_line
+
+            macd_bullish = (
+                (macd_line.iloc[-1] > signal_line.iloc[-1]) and
+                (histogram.iloc[-1] > histogram.iloc[-2])
+            )
+            
+            rsi = talib.RSI(df['close'], 14).iloc[-1]
+            rsi_above_45 = rsi > 45  # Relaxed from 50
+            
+            # Volatility Check (keep existing)
+            current_price = df['close'].iloc[-1]
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            valid_atr = 1.0 <= (atr/current_price)*100 <= 3.5
+            
+            # Volume Validation (relaxed multiplier)
+            volume = df['volume'].iloc[-1]
+            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
+            strong_volume = volume > vol_ma * 1.1  # Reduced from 1.2
+            
+            # Support Check (wider threshold)
+            support_levels, _ = await self.calculate_support_resistance(df, symbol)
+            near_support = any(abs(current_price - s)/s < 0.015 for s in support_levels[:3])
+            
+            logger.info(f"\n4H Analysis for {symbol}:")
+            logger.info(f"Price > EMA9: {'✅' if price_above_ema9 else '❌'}") 
+            logger.info(f"MACD Bullish: {'✅' if macd_bullish else '❌'} | RSI: {rsi:.1f}")
+            logger.info(f"ATR: {(atr/current_price)*100:.1f}% | Volume: {'✅' if strong_volume else '❌'}")
+            logger.info(f"Near Support: {'✅' if near_support else '❌'}")
+
+            return all([
+                price_above_ema9,
+                macd_bullish,
+                rsi_above_45,
+                valid_atr,
+                strong_volume,
+                near_support
+            ])
+            
+        except Exception as e:
+            logger.error(f"4H analysis error: {e}")
+            return False
+
+    async def _analyze_1h(self, df: pd.DataFrame, symbol: str) -> bool:
+        """1-hour trend confirmation for 15min entries - Relaxed Version"""
+        try:
+            # Keep EMA calculations for reference but remove cross requirement
+            df['ema9'] = talib.EMA(df['close'], 9)
+            df['ema21'] = talib.EMA(df['close'], 21)
+            
+            # Simplified price relationship check
+            price_above_ema9 = df['close'].iloc[-1] > df['ema9'].iloc[-1]
+            
+            # Momentum Check (keep existing)
+            macd_line, signal_line, _ = talib.MACD(df['close'])
+            histogram = macd_line - signal_line
+            macd_bullish = (
+                (macd_line.iloc[-1] > signal_line.iloc[-1]) and
+                (histogram.iloc[-1] > histogram.iloc[-2]) and
+                (macd_line.iloc[-1] > 0)
+            )
+            
+            # Keep other existing checks
+            current_price = df['close'].iloc[-1]
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            valid_atr = 1.0 <= (atr/current_price)*100 <= 3.0
+            
+            volume = df['volume'].iloc[-1]
+            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
+            strong_volume = volume > vol_ma * 1.15
+            
+            support_levels, _ = await self.calculate_support_resistance(df, symbol)
+            near_support = any(abs(current_price - s)/s < 0.008 for s in support_levels[:3])
+            
+            # Updated logging
+            logger.info(f"\n1H Analysis for {symbol}:")
+            logger.info(f"Price > EMA9: {'✅' if price_above_ema9 else '❌'}")
+            logger.info(f"MACD Bullish: {'✅' if macd_bullish else '❌'} | ATR: {(atr/current_price)*100:.1f}%")
+            logger.info(f"Volume: {'✅' if strong_volume else '❌'} | Near Support: {'✅' if near_support else '❌'}")
+
+            # Simplified return conditions
+            return all([
+                price_above_ema9,  # Basic trend alignment
+                macd_bullish,
+                valid_atr,
+                strong_volume,
+                near_support
+            ])
+            
+        except Exception as e:
+            logger.error(f"1H analysis error: {e}")
+            return False
+
+    async def _analyze_5m(self, df: pd.DataFrame, symbol: str) -> bool:
+        """5-minute analysis with reversal confirmation"""
+        try:
+            # EMA Structure
+            df['ema9'] = talib.EMA(df['close'], 9)
+            df['ema21'] = talib.EMA(df['close'], 21)
+            
+
+            # Immediate trend requirements
+            current_above = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
+            prev_below = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
+            ema_bullish = current_above and prev_below
+            
+            # Momentum confirmation with enhanced MACD check
+            macd_line, signal_line, _ = talib.MACD(
+                df['close'],
+                fastperiod=self.macd_fast,
+                slowperiod=self.macd_slow,
+                signalperiod=self.macd_signal
+            )
+            histogram = macd_line - signal_line
+            macd_bullish = (
+                (macd_line.iloc[-1] > signal_line.iloc[-1]) and
+                (histogram.iloc[-1] > histogram.iloc[-2]) and  # Histogram increasing
+                (macd_line.iloc[-1] > 0)  # Require MACD above zero line
+            )
+            
+            # Add reversal confirmation
+            rsi = talib.RSI(df['close'], 14).iloc[-1]
+            rsi_prev = talib.RSI(df['close'], 14).iloc[-2]
+            rsi_bullish = (rsi > 30) and (rsi_prev <= 30)  # Cross above oversold
+            
+
+            # Strengthen MACD check
+            macd_rising = (macd_line.iloc[-1] > macd_line.iloc[-2])  # MACD histogram rising
+            
+            # Volume spike check with NaN handling
+            current_volume = df['volume'].iloc[-1]
+            
+            # Handle empty/invalid volume data
+            if len(df) < 20 or df['volume'].isnull().all():
+                vol_ma = current_volume  # Fallback to current volume
+            else:
+                vol_ma = df['volume'].rolling(20, min_periods=1).mean().iloc[-1]
+            
+            volume_spike = current_volume > vol_ma * 1.3
+            
+            # Calculate ATR before logging
+            current_price = df['close'].iloc[-1]
+            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            
+            # Now safe to log both values
+            volume_ratio = current_volume / vol_ma if (vol_ma > 0 and not pd.isna(vol_ma)) else 0
+            logger.info(f"Volume: {volume_ratio:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
+
+            # Volatility filter (aligned with line 3784-3791)
+            valid_atr = 0.015 <= (atr/current_price) <= 0.03  # 1.5-3% range
+            
+            # Support alignment (using 15m levels from line 830-833)
+            _, fifteen_m_supports = await self.calculate_support_resistance(df, symbol)
+            near_support = any(abs(current_price - s)/s < 0.005 for s in fifteen_m_supports[:3])
+            
+            # Bullish candle pattern
+            last_candle = df.iloc[-1]
+            bullish_candle = (last_candle['close'] > last_candle['open']) and \
+                            ((last_candle['high'] - last_candle['low'])/current_price > 0.01)
+            
+            logger.info(f"\n5M Analysis for {symbol}:")
+            logger.info(f"EMA Cross: {'✅' if ema_bullish else '❌'} | MACD: {'✅' if macd_bullish else '❌'}")
+            logger.info(f"Volume: {current_volume/vol_ma:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
+            logger.info(f"Near 15m Support: {'✅' if near_support else '❌'} | Bullish Candle: {'✅' if bullish_candle else '❌'}")
+            logger.info(f"Reversal Confirmation:")
+            logger.info(f"RSI Cross >30: {'✅' if rsi_bullish else '❌'} ({rsi_prev:.1f} → {rsi:.1f})")
+            logger.info(f"MACD Rising: {'✅' if macd_rising else '❌'}")
+
+            return all([
+                ema_bullish,
+                macd_bullish,
+                macd_rising,  # New condition
+                rsi_bullish,  # New condition
+                volume_spike,
+                valid_atr,
+                near_support,
+                bullish_candle
+            ])
+            
+        except Exception as e:
+            logger.error(f"5M analysis error: {e}")
+            return False
+
+    async def _validate_symbol(self, symbol):
+        """Parallel technical validation for a single symbol"""
+        try:
+            # Add multi-timeframe data loading
+            timeframes = ['1d', '4h', '1h', '5m']
+            daily_df, four_hour_df, hourly_df, five_min_df = await asyncio.gather(
+                *[self.get_historical_data(symbol, tf) for tf in timeframes]
+            )
+            
+            # Original validation logic continues...
+            df = await self.get_historical_data(symbol)
+            if df is None or df.empty:
+                return False
+
+            # Add proper sentiment analysis with data validation
+            try:
+                # First validate the DataFrame structure
+                required_columns = ['open', 'high', 'low', 'close']
+                if not all(col in daily_df.columns for col in required_columns):
+                    missing = [col for col in required_columns if col not in daily_df.columns]
+                    logger.error(f"Missing columns in daily data: {missing}")
+                    return False
+
+                # Then convert values
+                sentiment_params = {
+                    'timeframe': '1d',
+                    'price_data': {
+                        'open': [float(x) for x in daily_df['open'].tolist()],
+                        'high': [float(x) for x in daily_df['high'].tolist()],
+                        'low': [float(x) for x in daily_df['low'].tolist()],
+                        'close': [float(x) for x in daily_df['close'].tolist()]
+                    }
+                }
+                sentiment_score = await self.market_analyzer.get_market_sentiment(
+                    data=sentiment_params, 
+                    symbol=symbol
+                )
                 logger.info(f"Sentiment Score: {sentiment_score:.2f}")
                 
                 if sentiment_score < 0.6:
-                    logger.info("❌ Market sentiment not bullish enough")
+                    logger.info(f"❌ Market sentiment not bullish enough: {sentiment_score:.2f}")
                     return False
+                    
+            except Exception as e:
+                logger.error(f"Sentiment analysis failed: {e}")
+                return False
 
             # Continue with existing validation logic...
             current_price = float(df['close'].iloc[-1])
@@ -3558,14 +3782,16 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"Price: ${current_price:.4f}")
             
             # Calculate base technical indicators
-            rsi = ta.RSI(df['close'], timeperiod=14).iloc[-1]
-            bb_upper, bb_middle, bb_lower = ta.BBANDS(df['close'], timeperiod=20)
+            rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1]
+            bb_upper, bb_middle, bb_lower = talib.BBANDS(df['close'], timeperiod=20)
             bb_width = (bb_upper.iloc[-1] - bb_lower.iloc[-1]) / bb_middle.iloc[-1]
-            atr = ta.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+
+            atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
             
+
             # Daily timeframe conditions
-            daily_ema9 = ta.EMA(daily_df['close'], timeperiod=9)
-            daily_ema21 = ta.EMA(daily_df['close'], timeperiod=21)
+            daily_ema9 = talib.EMA(daily_df['close'], timeperiod=9)
+            daily_ema21 = talib.EMA(daily_df['close'], timeperiod=21)
             
             # Define daily EMA cross
             daily_ema_cross = (
@@ -3578,9 +3804,10 @@ class KrakenAdvancedGridStrategy:
                 logger.info("❌ No daily 9/21 EMA bullish cross")
                 return False
             
-            daily_rsi = ta.RSI(daily_df['close'], timeperiod=14).iloc[-1]
-            daily_rsi_prev = ta.RSI(daily_df['close'], timeperiod=14).iloc[-2]
-            daily_macd = ta.MACD(daily_df['close'])
+            daily_rsi = talib.RSI(daily_df['close'], timeperiod=14).iloc[-1]
+            daily_rsi_prev = talib.RSI(daily_df['close'], timeperiod=14).iloc[-2]
+            daily_macd = talib.trend.MACD(daily_df['close'])
+
             daily_macd_cross = (
                 daily_macd.macd().iloc[-1] > daily_macd.macd_signal().iloc[-1] and
                 daily_macd.macd().iloc[-2] <= daily_macd.macd_signal().iloc[-2]
@@ -3617,9 +3844,10 @@ class KrakenAdvancedGridStrategy:
                     return False
                 
                 # 2. Check 4H and 1H RSI
-                four_hour_rsi = ta.RSI(four_hour_df['close'], timeperiod=14).iloc[-1]
-                hourly_rsi = ta.RSI(hourly_df['close'], timeperiod=14).iloc[-1]
+                four_hour_rsi = talib.RSI(four_hour_df['close'], timeperiod=14).iloc[-1]
+                hourly_rsi = talib.RSI(hourly_df['close'], timeperiod=14).iloc[-1]
                 
+
                 if four_hour_rsi < 50 or hourly_rsi < 50:
                     logger.info("❌ 4H or 1H RSI below 50")
                     return False
@@ -3638,15 +3866,21 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"❌ BB Width too high: {bb_width:.3f}")
                     return False
                 
-                if (atr/current_price) > 0.03:
+                if (atr/current_price) > 0.04:  # 4% threshold
                     logger.info(f"❌ ATR too high: {(atr/current_price)*100:.1f}%")
                     return False
                 
-                # 4. Check 5min EMAs and MACD
-                ema9 = ta.EMA(five_min_df['close'], timeperiod=9).iloc[-1]
-                ema21 = ta.EMA(five_min_df['close'], timeperiod=21).iloc[-1]
-                ema200 = ta.EMA(five_min_df['close'], timeperiod=200).iloc[-1]
+                # New addition: Minimum ATR requirement (1.5-3% daily range)
+                elif (atr/current_price) < 0.015:  # 1.5% threshold
+                    logger.info(f"❌ ATR too low: {(atr/current_price)*100:.1f}% - Stagnant price action")
+                    return False
                 
+                # 4. Check 5min EMAs and MACD
+                ema9 = talib.EMA(five_min_df['close'], timeperiod=9).iloc[-1]
+                ema21 = talib.EMA(five_min_df['close'], timeperiod=21).iloc[-1]
+                ema200 = talib.EMA(five_min_df['close'], timeperiod=200).iloc[-1]
+                
+
                 if not (ema9 > ema21 > ema200):
                     logger.info("❌ EMAs not in bullish alignment")
                     return False
@@ -3681,10 +3915,11 @@ class KrakenAdvancedGridStrategy:
                     return False
                 
                 # Technical Structure
-                ema9 = ta.EMA(df['close'], timeperiod=9).iloc[-1]
-                ema21 = ta.EMA(df['close'], timeperiod=21).iloc[-1]
-                ema200 = ta.EMA(df['close'], timeperiod=200).iloc[-1]
+                ema9 = talib.EMA(df['close'], timeperiod=9).iloc[-1]
+                ema21 = talib.EMA(df['close'], timeperiod=21).iloc[-1]
+                ema200 = talib.EMA(df['close'], timeperiod=200).iloc[-1]
                 
+
                 # Check EMA alignment for trend
                 if current_price < ema200:
                     logger.info("❌ Price below 200 EMA - Not in uptrend")
@@ -3704,10 +3939,11 @@ class KrakenAdvancedGridStrategy:
                     return False
                 
                 # 5. MACD Momentum
-                macd = ta.MACD(df['close'])
+                macd = talib.MACD(df['close'])
                 if macd.macd().iloc[-1] < macd.macd_signal().iloc[-1]:
                     logger.info("❌ MACD below signal line - Weak momentum")
                     return False
+
                 
                 logger.info("\n✅ Regular asset entry conditions met:")
                 logger.info(f"- Daily timeframe confirmation")
@@ -3832,6 +4068,348 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error calculating available balance: {e}")
             return 0.0
 
+    async def execute_stop_loss(self, symbol: str, position_size: float, is_spot: bool, reason: str = "stop loss") -> bool:
+        """Execute stop loss order with retries and confirmation"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Verify spot balance first
+                balance = await self.exchange.fetch_balance()
+                asset = symbol.split('/')[0]
+                spot_balance = float(balance.get(asset, {}).get('free', 0))
+                
+                if spot_balance <= 0:
+                    logger.error(f"No spot balance found for {asset}, cleaning up tracking")
+                    if symbol in self.positions:
+                        del self.positions[symbol]
+                    if symbol in self.active_positions:
+                        del self.active_positions[symbol]
+                    return True  # Return True since position is already closed
+                
+                logger.error(f"\n{'='*50}")
+                logger.error(f"🚨 EXECUTING {reason.upper()} - Attempt {attempt + 1}/{max_retries}")
+                logger.error(f"Symbol: {symbol}")
+                logger.error(f"Actual Balance: {spot_balance} {asset}")
+                
+                # Use actual spot balance for order
+                params = {
+                    'ordertype': 'market',
+                    'trading_agreement': 'agree'
+                }
+                
+                order = await self.exchange.create_market_order(
+                    symbol=symbol,
+                    side='sell',
+                    amount=spot_balance,
+                    params=params
+                )
+                
+                if order and 'id' in order:
+                    logger.error(f"✅ {reason.upper()} executed successfully")
+                    logger.error(f"Order ID: {order['id']}")
+                    logger.error(f"Size: {spot_balance}")
+                    logger.error(f"{'='*50}\n")
+                    
+                    # Clean up position tracking
+                    if symbol in self.positions:
+                        del self.positions[symbol]
+                    if symbol in self.active_positions:
+                        del self.active_positions[symbol]
+                    return True
+                
+                logger.error(f"❌ No order ID returned - Attempt {attempt + 1}")
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"❌ Error executing {reason}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                continue
+        
+        logger.error(f"❌ Failed to execute {reason} after {max_retries} attempts")
+        return False
+
+    async def validate_order_size(self, symbol: str, amount: float) -> bool:
+        """Always validate order size as true to allow any size orders"""
+        try:
+            logger.info(f"Allowing order for {symbol} with size {amount}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in order size validation: {e}")
+            return True  # Still return True on error to allow order
+
+    async def validate_grid_order_size(self, symbol: str, size: float) -> float:
+        """Validate if grid order size meets exchange minimums"""
+        try:
+            # Get market info from exchange
+            market = self.exchange.market(symbol)
+            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
+            
+            if size < min_amount:
+                logger.warning(f"Grid order size {size} is below minimum {min_amount} for {symbol}")
+                # Calculate the adjusted size to meet minimum
+                adjusted_size = min_amount * 1.01  # Add 1% buffer
+                logger.info(f"Adjusting grid order size to {adjusted_size}")
+                return adjusted_size
+                
+            return size
+            
+        except Exception as e:
+            logger.error(f"Error validating grid order size: {e}")
+            return size  # Return original size if validation fails
+
+    async def verify_actual_positions(self) -> List[Dict]:
+        """Verify actual positions vs open orders"""
+        try:
+            balance = await self.exchange.fetch_balance()
+            markets = await self.exchange.fetch_markets()
+            
+            # Create mapping of cleaned currencies to proper symbols
+            symbol_map = {
+                m['base'].replace('XBT', 'BTC')
+                          .replace('XX', '')
+                          .replace('Z', '')
+                          .replace('.S', ''): m['symbol']
+                for m in markets 
+                if m['quote'] == 'USD' and '/USD' in m['symbol']
+            }
+
+            actual_positions = []
+            for currency, amount in balance.get('total', {}).items():
+                clean_currency = currency.replace('XBT', 'BTC') \
+                                      .replace('XX', '') \
+                                      .replace('Z', '') \
+                                      .replace('.S', '')
+                
+                if clean_currency not in symbol_map:
+                    continue
+
+                total_amount = float(amount)
+                if total_amount > 0.000001:
+                    try:
+                        proper_symbol = symbol_map[clean_currency]
+                        
+                        # Get ALL trades for this symbol in last 30 days
+                        since = self.exchange.milliseconds() - (86400 * 1000 * 30)  # 30 days
+                        trades = await self.exchange.fetch_my_trades(proper_symbol, since=since)
+                        
+                        # Find initial entry price from buy trades
+                        buy_trades = [t for t in trades if t['side'] == 'buy']
+                        if buy_trades:
+                            # Sort by timestamp to get earliest buys first
+                            buy_trades.sort(key=lambda x: x['timestamp'])
+                            # Take first few buys that match our current position size
+                            accumulated = 0
+                            cost = 0
+                            for trade in buy_trades:
+                                if accumulated < total_amount:
+                                    trade_amount = float(trade['amount'])
+                                    trade_cost = float(trade['cost'])
+                                    accumulated += trade_amount
+                                    cost += trade_cost
+                            
+                            if accumulated > 0:
+                                entry_price = cost / accumulated
+                                logger.info(f"Found initial entry for {proper_symbol} at {entry_price:.6f}")
+                            else:
+                                entry_price = await self.get_current_price(proper_symbol)
+                        else:
+                            entry_price = await self.get_current_price(proper_symbol)
+                        
+                        position = {
+                            'symbol': proper_symbol,
+                            'info': {
+                                'symbol': proper_symbol,
+                                'size': total_amount,
+                                'price': entry_price,
+                                'side': 'long',
+                                'is_spot': True
+                            }
+                        }
+                        
+                        # Update both tracking systems
+                        self.active_positions[proper_symbol] = position
+                        self.positions[proper_symbol] = {
+                            'entry_price': entry_price,
+                            'position_size': total_amount,
+                            'side': 'buy',
+                            'trailing_stop': None,
+                            'tp1_triggered': False,
+                            'tp2_triggered': False,
+                            'breakeven_triggered': False,
+                            'trailing_active': False,
+                            'is_spot': True,
+                            'stop_buffer': 0.02
+                        }
+                        
+                        actual_positions.append(position)
+                        logger.info(f"Verified position: {proper_symbol} - Entry: {entry_price:.6f}")
+                        
+                    except Exception as e:
+                        logger.error(f"Position error {clean_currency}: {str(e)[:100]}")
+                        continue
+
+            return actual_positions
+
+        except Exception as e:
+            logger.error(f"Position verification failed: {e}")
+            return []
+
+    async def _check_resistance_levels(self, symbol, current_price):
+        """Check if current price is near any resistance level"""
+        try:
+            df = await self.get_historical_data(symbol)
+            if df is None or df.empty:
+                return False
+
+            support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
+            return any(abs(current_price - r) / r < 0.03 for r in resistance_levels)
+        except Exception as e:
+            logger.error(f"Error checking resistance levels for {symbol}: {e}")
+            return False
+
+    def normalize_symbol(self, symbol: str) -> str:
+        """Normalize symbol format for Kraken API"""
+        # Kraken requires symbols like 'XLM/USD' instead of 'XLMUSD'
+        if '/' not in symbol:
+            # Handle different symbol formats
+            base = symbol[:3] if len(symbol) == 6 else symbol[:4]
+            quote = symbol[3:] if len(symbol) == 6 else symbol[4:]
+            return f"{base}/{quote}"
+        return symbol.upper().replace(' ', '').replace('-', '')
+
+    async def get_average_entry_price(self, symbol: str, position_size: float, mid_price: float) -> float:
+        """Get actual average entry price from trades history"""
+        try:
+            # First check active positions for existing entry price
+            if symbol in self.active_positions:
+                entry_price = self.active_positions[symbol]['info'].get('price')
+                if entry_price:
+                    logger.info(f"Using tracked active position entry price: {entry_price:.6f}")
+                    return float(entry_price)
+            
+            # Then check positions dictionary
+            if symbol in self.positions:
+                entry_price = self.positions[symbol].get('entry_price')
+                if entry_price:
+                    logger.info(f"Using tracked position entry price: {entry_price:.6f}")
+                    return float(entry_price)
+
+            # If no tracked price, calculate from trade history
+            since = self.exchange.milliseconds() - (86400 * 1000 * 7)  # Last 7 days
+            trades = await self.exchange.fetch_my_trades(symbol, since=since)
+            
+            if trades:
+                buy_trades = [t for t in trades if t['side'] == 'buy']
+                if buy_trades:
+                    total_cost = sum(float(t['cost']) for t in buy_trades)
+                    total_amount = sum(float(t['amount']) for t in buy_trades)
+                    
+                    if total_amount > 0:
+                        avg_price = total_cost / total_amount
+                        logger.info(f"Found historical entry price from trades: {avg_price:.6f}")
+                        return avg_price
+
+            logger.warning(f"No historical entry found, using current price: {mid_price}")
+            return mid_price
+
+        except Exception as e:
+            logger.error(f"Entry price error for {symbol}: {e}")
+            return mid_price
+
+    async def _price_position_checks(self, current_price: float, 
+                                    support_levels: List[float], 
+                                    resistance_levels: List[float]) -> bool:
+        """Validate price position relative to support/resistance levels"""
+        try:
+            # Resistance check with buffer
+            above_resistance = False
+            if resistance_levels:
+                nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
+                resistance_buffer = nearest_resistance * 0.02  # 2% buffer
+                above_resistance = current_price > (nearest_resistance + resistance_buffer)
+                logger.info(f"Resistance Check: {current_price:.4f} vs {nearest_resistance:.4f} (+2% buffer)")
+
+            # Support zone check
+            near_support = False
+            if support_levels:
+                # Check against first 3 support levels with 1.5% tolerance
+                relevant_supports = sorted(support_levels)[:3]
+                near_support = any(abs(current_price - s)/s < 0.015 for s in relevant_supports)
+                logger.info(f"Support Check: Near {'✅' if near_support else '❌'}")
+
+            logger.info(f"Price Position: {'✅ Above Resistance' if above_resistance else '⚠️ Neutral' if near_support else '❌ Below Support'}")
+            
+            return above_resistance or near_support
+            
+        except Exception as e:
+            logger.error(f"Price position check error: {e}")
+            return False
+
+    async def detect_bear_bounce(self, df: pd.DataFrame) -> bool:
+        """Identify potential counter-trend rallies in bear markets"""
+        try:
+            # Require 3+ red candles followed by green
+            last_3_closes = df['close'].iloc[-3:].values
+            direction_changes = np.diff(np.sign(np.diff(last_3_closes)))
+            bounce_signal = (direction_changes[-1] > 0) and (df['volume'].iloc[-1] > df['volume'].iloc[-2]*1.5)
+            
+            # Add RSI confirmation
+            rsi = ta.RSI(df['close'], 14).iloc[-1]
+            return bounce_signal and (rsi < 35)
+        except Exception as e:
+            logger.error(f"Bounce detection error: {e}")
+            return False
+    
+    def is_weekend(self):
+        """Check if current time is weekend in Kraken's primary markets (UTC-7 to UTC+3)"""
+        try:
+            # Get current time in UTC
+            utc_now = datetime.now(timezone.utc)
+            
+            # Check major crypto market timezones
+            market_tz = [
+                pytz.timezone('America/Los_Angeles'),  # UTC-7/-8
+                pytz.timezone('Europe/London'),        # UTC+0/+1
+                pytz.timezone('Asia/Hong_Kong')        # UTC+8
+            ]
+            
+            # Check if any major market is in weekend
+            for tz in market_tz:
+                local_time = utc_now.astimezone(tz)
+                if local_time.weekday() >= 5:  # 5=Saturday, 6=Sunday
+                    return True
+            return False
+            
+        except Exception as e:
+            logger.error(f"Weekend check error: {e}")
+            return False
+    
+    async def refresh_grid_levels(self, symbol: str) -> None:
+        """Recalculate grid levels after trades"""
+        try:
+            logger.info(f"🔄 Refreshing grid levels for {symbol}")
+            
+            # Get updated market data
+            df = await self.get_historical_data(symbol)
+            if df is None or df.empty:
+                logger.warning(f"❌ No data for {symbol} refresh")
+                return
+                
+            # Recalculate support/resistance
+            support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
+            
+            # Update grid prices
+            current_price = df['close'].iloc[-1]
+            grid_prices = await self.calculate_hybrid_grids(
+                symbol, df, support_levels, resistance_levels
+            )
+            logger.info(f"Current price: {current_price} | Grid levels: {len(grid_prices)}")
+            
+        except Exception as e:
+            logger.error(f"Grid refresh error: {e}")
+
 if __name__ == "__main__":
     try:
         # Set up proper event loop policy for Windows
@@ -3843,6 +4421,7 @@ if __name__ == "__main__":
         
         # Initialize strategy
         strategy = KrakenAdvancedGridStrategy(demo_mode=False)
+        strategy.is_spot = True  # Force spot mode
         
         # Run with proper error handling
         loop = asyncio.get_event_loop()
