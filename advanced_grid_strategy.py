@@ -23,9 +23,9 @@ class KrakenAdvancedGridStrategy:
     def __init__(self, demo_mode=False):  # Set default to False for live
         self.demo_mode = demo_mode
         self.STABLE_BLACKLIST = {
-        'EUR/USD', 'USDC/USD', 'USDT/USD',
-        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD'
-    }
+        'EUR/USD', 'USDC/USD', 'USDT/USD', 'AUD/USD',
+        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD', 'AUD/USD:USD'
+        }
 
         
         # Load environment variables
@@ -1499,24 +1499,32 @@ class KrakenAdvancedGridStrategy:
         try:
             # Get position details
             entry_price = float(position['info']['price'])
-            position_side = position['info'].get('side', 'long')
+            position_side = position['info'].get('side', 'long')  # Default to 'long' for spot
             position_size = float(position['info'].get('size', 0))
             
             # Initialize position tracking if not exists
             if symbol not in self.positions:
                 # Get accurate entry from recent orders first
                 try:
-                    # Force spot check first
-                    balance = await self.verify_actual_positions()
-                    raw_asset = symbol.split('/')[0].replace(':USD', '')
+                    # FORCE spot check first before anything else
+                    balance = await self.exchange.fetch_balance()
+                    raw_asset = symbol.split('/')[0].replace(':USD', '')  # Remove :USD suffix
                     asset = raw_asset
                     spot_balance = float(balance.get(asset, {}).get('free', 0))
                     total_balance = float(balance.get(asset, {}).get('total', 0))
-                    is_spot = True
-
-                    # Get entry price from order history
-                    clean_symbol = f"{raw_asset}/USD"
-                    orders = await self.get_average_entry_price(clean_symbol, limit=5)
+                    is_spot = True  # FORCE SPOT for now
+                    
+                    logger.info(f"\n{'='*50}")
+                    logger.info(f"FORCING SPOT MODE for {symbol}:")
+                    logger.info(f"Asset: {asset}")
+                    logger.info(f"Free Balance: {spot_balance}")
+                    logger.info(f"Total Balance: {total_balance}")
+                    logger.info(f"Is Spot: {is_spot}")
+                    logger.info(f"{'='*50}\n")
+                    
+                    # Then get entry price with correct symbol format
+                    clean_symbol = f"{raw_asset}/USD"  # Use clean symbol format
+                    orders = await self.exchange.fetch_closed_orders(clean_symbol, limit=5)
                     entry_orders = [order for order in orders 
                                   if order['status'] == 'closed' 
                                   and order['side'] == 'buy']
@@ -1526,16 +1534,6 @@ class KrakenAdvancedGridStrategy:
                     else:
                         # Fallback to position info
                         entry_price = float(position['info'].get('price', current_price))
-
-                    # Update both position tracking systems
-                    self.active_positions[symbol] = {
-                        'info': {
-                            'price': entry_price,
-                            'size': position_size,
-                            'side': 'buy',
-                            'is_spot': is_spot
-                        }
-                    }
                     
                     self.positions[symbol] = {
                         'trailing_stop': None,
@@ -1545,8 +1543,10 @@ class KrakenAdvancedGridStrategy:
                         'trailing_active': False,
                         'stop_buffer': 0.002,
                         'original_size': position_size,
+                        'current_position_size': position_size,  # Add this to track remaining size
                         'entry_price': entry_price,
                         'is_spot': is_spot,
+                        'position_side': position_side,  # Add this to track position side
                         'spot_balance': max(spot_balance, total_balance)
                     }
                     
@@ -1560,13 +1560,13 @@ class KrakenAdvancedGridStrategy:
                     return
                 
             position_data = self.positions[symbol]
-            entry_price = position_data['entry_price']
+            entry_price = position_data['entry_price']  # Changed from initial_entry_price to match
             is_spot = position_data.get('is_spot', False)
+            position_side = position_data.get('position_side', 'long')  # Get from position data
             
             # Get mark price with validation
             try:
                 ticker = await self.exchange.fetch_ticker(symbol)
-                logger.debug(f"Raw ticker data: {ticker}")  # Add this line
                 if is_spot:
                     current_price = float(ticker['last'])  # Use last price for spot
                 else:
@@ -1642,14 +1642,19 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Stop Price: ${stop_price:.4f}")
                     logger.info(f"P&L: {profit_pct:.2f}%")
                     
-                    # Remove the redundant entry price check
-                    await self.execute_stop_loss(
-                        symbol=symbol,
-                        position_size=position_size,
-                        is_spot=is_spot,
-                        reason="stop loss"
-                    )
-                    return
+                    # Only execute if actually in loss
+                    if current_price < entry_price:
+                        logger.info("Confirming actual loss before stop")
+                        await self.execute_stop_loss(
+                            symbol=symbol,
+                            position_size=position_data['current_position_size'],  # Use tracked size
+                            is_spot=is_spot,
+                            reason="stop loss"
+                        )
+                        return  # Add return here to handle the stop execution
+                    else:
+                        logger.info("Position in profit, skipping stop loss")
+                        return
                 
             except Exception as e:
                 logger.error(f"Error checking stop loss: {e}")
@@ -1855,8 +1860,7 @@ class KrakenAdvancedGridStrategy:
                 try:
                     balance = await self.exchange.fetch_balance()
                     asset = symbol.split('/')[0]
-                    spot_balance = float(balance.get(asset, {}).get('free', 0)) + \
-                                   float(balance.get(asset, {}).get('used', 0))
+                    spot_balance = float(balance.get(asset, {}).get('free', 0))
                     is_spot = spot_balance > 0  # Override is_spot based on actual balance
                     logger.info(f"\nVerified {asset} spot balance: {spot_balance}")
                 except Exception as e:
@@ -1964,64 +1968,45 @@ class KrakenAdvancedGridStrategy:
         logger.error(f"❌ Failed to execute {tp_type} after {max_retries} attempts")
         return False
 
-    async def monitor_positions(self, symbols: List[str] = None) -> None:
-        """Monitor positions with accurate price tracking"""
+    async def monitor_positions(self):
+        """Monitor all positions for stop loss and take profit with enhanced logging"""
         try:
-            logger.info("\n=== MONITORING POSITIONS ===")
+            logger.error("\n=== MONITORING ACTIVE POSITIONS ===")  # Changed to ERROR level
+            positions = await self.verify_actual_positions()
+            logger.error(f"Raw positions data: {positions}")  # Add this to see raw data
+            logger.error(f"Found {len(positions)} positions to monitor")
+            logger.error(f"Current self.positions: {self.positions}")  # Add this
             
-            # Fetch actual positions from exchange
-            positions = await self.exchange.fetch_positions()
-            spot_balances = await self.exchange.fetch_balance()
+            if not positions:
+                logger.error("No positions found to monitor")
+                return
+                
+            for position in positions:
+                symbol = position['symbol']
+                logger.error(f"\nProcessing position: {symbol}")  # Changed to ERROR level
+                logger.error(f"Position data: {position}")  # Add this
+                
+                try:
+                    current_price = await self.get_current_price(symbol)
+                    logger.error(f"Current price: {current_price}")  # Changed to ERROR level
+                except Exception as e:
+                    logger.error(f"Failed to get price for {symbol}: {e}")
+                    continue
+                
+                logger.error(f"Calling manage_stop_loss for {symbol}")  # Changed to ERROR level
+                start_time = time.time()
+                try:
+                    result = await self.manage_stop_loss(symbol, position, current_price)
+                    duration = time.time() - start_time
+                    logger.error(f"manage_stop_loss completed in {duration:.2f}s | Result: {result}")
+                except Exception as e:
+                    logger.error(f"Error in manage_stop_loss for {symbol}: {str(e)}", exc_info=True)
+                    continue
+                    
+            logger.error("=== FINISHED POSITION MONITORING ===\n")
             
-            for symbol in (symbols or self.active_symbols):
-                # Spot positions
-                asset = symbol.split('/')[0]
-                spot_bal = float(spot_balances.get(asset, {}).get('free', 0))
-                if spot_bal > 0:
-                    # Calculate average entry price from order history
-                    orders = await self.exchange.fetch_orders(symbol, since=self.start_time)
-                    buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
-                    if buy_orders:
-                        total_cost = sum(o['filled'] * o['average'] for o in buy_orders)
-                        total_amount = sum(o['filled'] for o in buy_orders)
-                        avg_entry = total_cost / total_amount
-                        
-                        # Get current market price for stop loss calculations
-                        try:
-                            ticker = await self.exchange.fetch_ticker(symbol)
-                            current_price = float(ticker['last'])
-                        except Exception as e:
-                            logger.error(f"Price fetch error for {symbol}: {e}")
-                            continue
-                        
-                        # Update both tracking systems with monitored entry price
-                        position_data = {
-                            'info': {
-                                'price': avg_entry,
-                                'size': spot_bal,
-                                'side': 'buy',
-                                'is_spot': True
-                            }
-                        }
-                        self.active_positions[symbol] = position_data
-                        
-                        if symbol in self.positions:
-                            self.positions[symbol]['entry_price'] = avg_entry
-                        
-                        # Call stop loss management with live price
-                        await self.manage_stop_loss(
-                            symbol=symbol,
-                            position=position_data,
-                            current_price=current_price
-                        )
-                        
-                        logger.info(f"Active Spot Position: {symbol}")
-                        logger.info(f"Size: {spot_bal}")
-                        logger.info(f"Entry: {avg_entry:.5f}")
-                        logger.info(f"Current Price: {current_price:.5f}")
-
         except Exception as e:
-            logger.error(f"Error monitoring positions: {e}")
+            logger.error(f"Error in position monitoring: {str(e)}", exc_info=True)
 
     async def start(self):
         while True:  # Outer loop for strategy restart
@@ -4160,27 +4145,18 @@ class KrakenAdvancedGridStrategy:
             return size  # Return original size if validation fails
 
     async def verify_actual_positions(self) -> List[Dict]:
-        """Verify actual positions vs open orders"""
+        """Verify actual positions vs open orders with precise FIFO tracking"""
         try:
             balance = await self.exchange.fetch_balance()
             markets = await self.exchange.fetch_markets()
             
-            # Create mapping of cleaned currencies to proper symbols
-            symbol_map = {
-                m['base'].replace('XBT', 'BTC')
-                          .replace('XX', '')
-                          .replace('Z', '')
-                          .replace('.S', ''): m['symbol']
-                for m in markets 
-                if m['quote'] == 'USD' and '/USD' in m['symbol']
-            }
+            # Create symbol mapping
+            symbol_map = {m['base'].replace('XBT','BTC').replace('XX','').replace('Z','').replace('.S',''): m['symbol'] 
+                         for m in markets if m['quote'] == 'USD' and '/USD' in m['symbol']}
 
             actual_positions = []
             for currency, amount in balance.get('total', {}).items():
-                clean_currency = currency.replace('XBT', 'BTC') \
-                                      .replace('XX', '') \
-                                      .replace('Z', '') \
-                                      .replace('.S', '')
+                clean_currency = currency.replace('XBT','BTC').replace('XX','').replace('Z','').replace('.S','')
                 
                 if clean_currency not in symbol_map:
                     continue
@@ -4190,32 +4166,42 @@ class KrakenAdvancedGridStrategy:
                     try:
                         proper_symbol = symbol_map[clean_currency]
                         
-                        # Get ALL trades for this symbol in last 30 days
-                        since = self.exchange.milliseconds() - (86400 * 1000 * 30)  # 30 days
+                        # Get ALL trades for this symbol
+                        since = self.exchange.milliseconds() - (86400 * 1000 * 30)
                         trades = await self.exchange.fetch_my_trades(proper_symbol, since=since)
                         
-                        # Find initial entry price from buy trades
-                        buy_trades = [t for t in trades if t['side'] == 'buy']
-                        if buy_trades:
-                            # Sort by timestamp to get earliest buys first
-                            buy_trades.sort(key=lambda x: x['timestamp'])
-                            # Take first few buys that match our current position size
-                            accumulated = 0
-                            cost = 0
-                            for trade in buy_trades:
-                                if accumulated < total_amount:
-                                    trade_amount = float(trade['amount'])
-                                    trade_cost = float(trade['cost'])
-                                    accumulated += trade_amount
-                                    cost += trade_cost
+                        # FIFO processing with sell reconciliation
+                        fifo_queue = []
+                        for trade in sorted(trades, key=lambda x: x['timestamp']):
+                            trade_size = float(trade['amount'])
                             
-                            if accumulated > 0:
-                                entry_price = cost / accumulated
-                                logger.info(f"Found initial entry for {proper_symbol} at {entry_price:.6f}")
+                            if trade['side'] == 'buy':
+                                fifo_queue.append((trade_size, float(trade['price'])))
+                            elif trade['side'] == 'sell':
+                                remaining_sell = trade_size
+                                while remaining_sell > 0 and fifo_queue:
+                                    oldest_size, oldest_price = fifo_queue[0]
+                                    if oldest_size > remaining_sell:
+                                        fifo_queue[0] = (oldest_size - remaining_sell, oldest_price)
+                                        remaining_sell = 0
+                                    else:
+                                        remaining_sell -= oldest_size
+                                        fifo_queue.pop(0)
+                        
+                        # Calculate remaining position cost basis
+                        total_cost = 0
+                        accumulated = 0
+                        for size, price in fifo_queue:
+                            if accumulated + size > total_amount:
+                                partial = total_amount - accumulated
+                                total_cost += partial * price
+                                accumulated = total_amount
+                                break
                             else:
-                                entry_price = await self.get_current_price(proper_symbol)
-                        else:
-                            entry_price = await self.get_current_price(proper_symbol)
+                                total_cost += size * price
+                                accumulated += size
+                        
+                        entry_price = total_cost / accumulated if accumulated > 0 else await self.get_current_price(proper_symbol)
                         
                         position = {
                             'symbol': proper_symbol,
@@ -4224,23 +4210,27 @@ class KrakenAdvancedGridStrategy:
                                 'size': total_amount,
                                 'price': entry_price,
                                 'side': 'long',
-                                'is_spot': True
+                                'is_spot': True,
+                                'start_time': time.time()
                             }
                         }
                         
-                        # Update both tracking systems
+                        # Update both tracking systems with complete fields
                         self.active_positions[proper_symbol] = position
                         self.positions[proper_symbol] = {
                             'entry_price': entry_price,
                             'position_size': total_amount,
                             'side': 'buy',
+                            'start_time': time.time(),
                             'trailing_stop': None,
                             'tp1_triggered': False,
                             'tp2_triggered': False,
                             'breakeven_triggered': False,
                             'trailing_active': False,
+                            'stop_buffer': 0.002,
+                            'original_size': total_amount,
                             'is_spot': True,
-                            'stop_buffer': 0.02
+                            'spot_balance': total_amount
                         }
                         
                         actual_positions.append(position)
@@ -4262,6 +4252,12 @@ class KrakenAdvancedGridStrategy:
             df = await self.get_historical_data(symbol)
             if df is None or df.empty:
                 return False
+            
+            # Ensure DataFrame has required columns
+            required_columns = ['high', 'low', 'close']
+            if not all(col in df.columns for col in required_columns):
+                logger.error(f"DataFrame for {symbol} missing required columns: {df.columns}")
+                return False
 
             support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
             return any(abs(current_price - r) / r < 0.03 for r in resistance_levels)
@@ -4280,42 +4276,64 @@ class KrakenAdvancedGridStrategy:
         return symbol.upper().replace(' ', '').replace('-', '')
 
     async def get_average_entry_price(self, symbol: str, position_size: float, mid_price: float) -> float:
-        """Get actual average entry price from trades history"""
+        """Get exact entry price using FIFO accounting"""
         try:
-            # First check active positions for existing entry price
-            if symbol in self.active_positions:
-                entry_price = self.active_positions[symbol]['info'].get('price')
-                if entry_price:
-                    logger.info(f"Using tracked active position entry price: {entry_price:.6f}")
-                    return float(entry_price)
-            
-            # Then check positions dictionary
+            # Check if we already have accurate tracking
             if symbol in self.positions:
-                entry_price = self.positions[symbol].get('entry_price')
-                if entry_price:
-                    logger.info(f"Using tracked position entry price: {entry_price:.6f}")
-                    return float(entry_price)
+                tracked_price = self.positions[symbol].get('entry_price')
+                if tracked_price and tracked_price > 0:
+                    return tracked_price
 
-            # If no tracked price, calculate from trade history
-            since = self.exchange.milliseconds() - (86400 * 1000 * 7)  # Last 7 days
-            trades = await self.exchange.fetch_my_trades(symbol, since=since)
+            # Calculate from trade history with FIFO matching
+            since = self.exchange.milliseconds() - (86400 * 1000 * 7)  # 1 week
+            all_trades = await self.exchange.fetch_my_trades(symbol, since=since)
             
-            if trades:
-                buy_trades = [t for t in trades if t['side'] == 'buy']
-                if buy_trades:
-                    total_cost = sum(float(t['cost']) for t in buy_trades)
-                    total_amount = sum(float(t['amount']) for t in buy_trades)
-                    
-                    if total_amount > 0:
-                        avg_price = total_cost / total_amount
-                        logger.info(f"Found historical entry price from trades: {avg_price:.6f}")
-                        return avg_price
+            if not all_trades:
+                return mid_price
 
-            logger.warning(f"No historical entry found, using current price: {mid_price}")
+            # Process trades in chronological order with FIFO
+            fifo_queue = []
+            
+            for trade in sorted(all_trades, key=lambda x: x['timestamp']):
+                trade_size = float(trade['amount'])
+                trade_price = float(trade['price'])
+                
+                if trade['side'] == 'buy':
+                    fifo_queue.append((trade_size, trade_price))
+                elif trade['side'] == 'sell':
+                    # Remove from oldest buys first
+                    while trade_size > 0 and fifo_queue:
+                        oldest_size, oldest_price = fifo_queue[0]
+                        if oldest_size > trade_size:
+                            fifo_queue[0] = (oldest_size - trade_size, oldest_price)
+                            trade_size = 0
+                        else:
+                            trade_size -= oldest_size
+                            fifo_queue.pop(0)
+
+            # Calculate remaining position cost basis
+            total_cost = 0
+            accumulated = 0
+            
+            for size, price in fifo_queue:
+                if accumulated + size > position_size:
+                    partial = position_size - accumulated
+                    total_cost += partial * price
+                    accumulated = position_size
+                    break
+                else:
+                    total_cost += size * price
+                    accumulated += size
+
+            if accumulated > 0:
+                exact_price = total_cost / accumulated
+                logger.info(f"Exact FIFO entry price: {exact_price:.6f} for {accumulated} {symbol}")
+                return exact_price
+
             return mid_price
 
         except Exception as e:
-            logger.error(f"Entry price error for {symbol}: {e}")
+            logger.error(f"FIFO price error {symbol}: {e}")
             return mid_price
 
     async def _price_position_checks(self, current_price: float, 
