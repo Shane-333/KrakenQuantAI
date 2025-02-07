@@ -1968,45 +1968,39 @@ class KrakenAdvancedGridStrategy:
         logger.error(f"❌ Failed to execute {tp_type} after {max_retries} attempts")
         return False
 
-    async def monitor_positions(self):
-        """Monitor all positions for stop loss and take profit with enhanced logging"""
+    async def monitor_positions(self, symbols: List[str] = None) -> None:
+        """Monitor positions with accurate price tracking"""
         try:
-            logger.error("\n=== MONITORING ACTIVE POSITIONS ===")  # Changed to ERROR level
-            positions = await self.verify_actual_positions()
-            logger.error(f"Raw positions data: {positions}")  # Add this to see raw data
-            logger.error(f"Found {len(positions)} positions to monitor")
-            logger.error(f"Current self.positions: {self.positions}")  # Add this
+            logger.info("\n=== MONITORING POSITIONS ===")
             
-            if not positions:
-                logger.error("No positions found to monitor")
-                return
-                
-            for position in positions:
+            # Get verified positions first
+            verified_positions = await self.verify_actual_positions()
+            
+            # Monitor each verified position
+            for position in verified_positions:
                 symbol = position['symbol']
-                logger.error(f"\nProcessing position: {symbol}")  # Changed to ERROR level
-                logger.error(f"Position data: {position}")  # Add this
-                
                 try:
-                    current_price = await self.get_current_price(symbol)
-                    logger.error(f"Current price: {current_price}")  # Changed to ERROR level
+                    # Get current price
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    current_price = float(ticker['last'])
+                    
+                    # Call manage_stop_loss with verified position data
+                    await self.manage_stop_loss(
+                        symbol=symbol,
+                        position=position,
+                        current_price=current_price
+                    )
+                    
+                    logger.info(f"Monitored {symbol} at ${current_price}")
+                    
                 except Exception as e:
-                    logger.error(f"Failed to get price for {symbol}: {e}")
-                    continue
-                
-                logger.error(f"Calling manage_stop_loss for {symbol}")  # Changed to ERROR level
-                start_time = time.time()
-                try:
-                    result = await self.manage_stop_loss(symbol, position, current_price)
-                    duration = time.time() - start_time
-                    logger.error(f"manage_stop_loss completed in {duration:.2f}s | Result: {result}")
-                except Exception as e:
-                    logger.error(f"Error in manage_stop_loss for {symbol}: {str(e)}", exc_info=True)
+                    logger.error(f"Error monitoring {symbol}: {e}")
                     continue
                     
             logger.error("=== FINISHED POSITION MONITORING ===\n")
             
         except Exception as e:
-            logger.error(f"Error in position monitoring: {str(e)}", exc_info=True)
+            logger.error(f"Position monitoring error: {e}")
 
     async def start(self):
         while True:  # Outer loop for strategy restart
