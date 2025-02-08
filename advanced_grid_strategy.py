@@ -184,6 +184,9 @@ class KrakenAdvancedGridStrategy:
         self.atr_periods = 14  # Standard 14-period ATR
         self.is_spot = False  # Default to False
 
+        # Add this line to initialize the attribute
+        self.min_position_size = 0.01  # Default value
+
     def initialize_exchange(self) -> None:
         """Initialize CCXT exchange connection"""
         try:
@@ -429,7 +432,7 @@ class KrakenAdvancedGridStrategy:
                 logger.error(f"Invalid DataFrame for {symbol}")
                 return False, 0.0
 
-            # Add market state detection ===============
+            # Add market state detection
             daily_df = await self.get_historical_data(symbol, '1d')
             if daily_df is not None and len(daily_df) >= 200:
                 daily_ma_200 = daily_df['close'].rolling(200).mean().iloc[-1]
@@ -437,7 +440,6 @@ class KrakenAdvancedGridStrategy:
                 market_state = "bull" if current_daily_close > daily_ma_200 else "bear"
                 logger.info(f"Market State: {market_state.upper()}")
                 
-                # Set dynamic thresholds
                 min_sentiment = 0.55 if market_state == "bear" else 0.6
                 rsi_floor = 35 if market_state == "bear" else 30
                 max_volatility = 0.4 if market_state == "bear" else 0.6
@@ -447,175 +449,125 @@ class KrakenAdvancedGridStrategy:
                 rsi_floor = 30
                 max_volatility = 0.6
 
-            # Check if we have insufficient funds and there's no active position
             if not self.has_sufficient_funds and symbol not in self.active_positions:
-                return False, 0.0  # Skip analysis for new positions
-                
-            # Quick check for active positions first (always check regardless of funds)
+                return False, 0.0
+
             if symbol in self.active_positions:
                 current_price = float(df.iloc[-1]['close'])
                 position = self.active_positions[symbol]
                 await self.manage_stop_loss(symbol, position, current_price)
-            
-            # Only continue analysis if we have funds or an active position
-            if self.has_sufficient_funds or symbol in self.active_positions:
-                async with asyncio.timeout(15):  # 15 second timeout
-                    tasks = []
-                    last_row = df.iloc[-1]
-                    
-                    # Format price data correctly for sentiment analysis
-                    try:
-                        price_data = {
-                            'timeframe': '1h',
-                            'price_data': {
-                                'open': df['open'].astype(float).tolist(),
-                                'high': df['high'].astype(float).tolist(),
-                                'low': df['low'].astype(float).tolist(),
-                                'close': df['close'].astype(float).tolist()
-                            }
-                        }
-                    except Exception as e:
-                        logger.error(f"Error formatting price data: {e}")
-                        return False, 0.0
-                    
-                    # Warm up model first
-                    await self.market_analyzer.warmup_model()
-                    
-                    # Add timeout for sentiment analysis
-                    ai_task = asyncio.create_task(
-                        asyncio.wait_for(
-                            self.market_analyzer.get_market_sentiment(price_data, symbol),
-                            timeout=25
-                        )
-                    )
-                    tasks.append(ai_task)
-                    
-                    # Add timeout error handling
-                    try:
-                        await ai_task
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Sentiment analysis timeout for {symbol}")
-                        return False, 0.0
-                    
-                    # Task 2: Calculate technical signals concurrently with error handling
-                    def calculate_signals():
-                        try:
-                            rsi = float(last_row['rsi'])
-                            # Use dynamic RSI floor from market state
-                            rsi_signal = rsi_floor <= rsi <= 70
-                            
-                            ema_trend = float(last_row['ema_short']) > float(last_row['ema_long'])
-                            
-                            macd_cross = float(last_row['macd']) > float(last_row['macd_signal'])
-                            
-                            current_bbw = float(last_row['bb_width'])
-                            bbw_valid = current_bbw < 0.5
-                            
-                            return rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid
-                        except Exception as e:
-                            logger.error(f"Error calculating technical signals: {e}")
-                            return False, False, False, 0.0, False
-                    
-                    # Run technical analysis in thread pool
-                    loop = asyncio.get_event_loop()
-                    tech_task = loop.run_in_executor(self.market_analyzer.thread_pool, calculate_signals)
-                    tasks.append(tech_task)
-                    
-                    # Wait for all tasks with error handling
-                    try:
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-                        
-                        # Check for exceptions in results
-                        if any(isinstance(r, Exception) for r in results):
-                            logger.error(f"Task error in analysis: {[r for r in results if isinstance(r, Exception)]}")
-                            return False, 0.0
-                            
-                        sentiment_score, tech_signals = results
-                        
-                        # Validate sentiment score
-                        if not isinstance(sentiment_score, (int, float)) or sentiment_score < 0 or sentiment_score > 1:
-                            logger.error(f"Invalid sentiment score: {sentiment_score}")
-                            return False, 0.0
-                        
-                        # Unpack technical signals
-                        rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid = tech_signals
-                        
-                        # Calculate final signals with dynamic sentiment threshold
-                        signal_strength = (
-                            (1 if rsi_signal else 0) +
-                            (1 if ema_trend else 0) +
-                            (1 if macd_cross else 0) +
-                            (1 if bbw_valid else 0) +
-                            float(sentiment_score)
-                        ) / 5.0
-                        
-                        # Use market-state adjusted minimum sentiment
-                        should_trade = signal_strength >= min_sentiment
-                        
-                        logger.info(f"Analysis complete - Sentiment: {sentiment_score:.2f} (Req: {min_sentiment}), Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
-                        
-                        return should_trade, current_bbw
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing analysis results: {e}")
-                        return False, 0.0
 
-        except asyncio.TimeoutError:
-            logger.error(f"Analysis timeout for {symbol}")
-            return False, 0.0
+            if self.has_sufficient_funds or symbol in self.active_positions:
+                tasks = []
+                last_row = df.iloc[-1]
+                
+                # Format price data
+                price_data = {
+                    'timeframe': '1h',
+                    'price_data': {
+                        'open': df['open'].astype(float).tolist(),
+                        'high': df['high'].astype(float).tolist(),
+                        'low': df['low'].astype(float).tolist(),
+                        'close': df['close'].astype(float).tolist()
+                    }
+                }
+                
+                # Get sentiment analysis
+                try:
+                    sentiment_score = await self.market_analyzer.get_market_sentiment(
+                        data=price_data,  # Pass the price_data dictionary we created above
+                        symbol=symbol
+                    )
+                    sentiment_valid = sentiment_score >= min_sentiment
+                    logger.info(f"Sentiment score: {sentiment_score:.2f}")
+                except Exception as e:
+                    logger.error(f"Error getting sentiment: {e}")
+                    sentiment_score = 0.5
+                    sentiment_valid = False
+                
+                # Calculate technical signals
+                rsi = float(last_row['rsi'])
+                rsi_signal = rsi_floor <= rsi <= 70
+                ema_trend = float(last_row['ema_short']) > float(last_row['ema_long'])
+                macd_cross = float(last_row['macd']) > float(last_row['macd_signal'])
+                current_bbw = float(last_row['bb_width'])
+                bbw_valid = current_bbw < 0.5
+
+                # Calculate volatility
+                returns = df['close'].pct_change()
+                volatility = returns.std() * np.sqrt(252) * 100
+
+                # Calculate signal strength with sentiment
+                signal_strength = (
+                    (1 if rsi_signal else 0) +
+                    (1 if ema_trend else 0) +
+                    (1 if macd_cross else 0) +
+                    (1 if bbw_valid else 0) +
+                    (1 if sentiment_valid else 0)
+                ) / 5.0
+
+                should_trade = signal_strength >= 0.6 and volatility <= max_volatility
+
+                logger.info(f"Analysis complete - Signal: {signal_strength:.2f}, "
+                           f"Volatility: {volatility:.2f}%, Trade: {'✅' if should_trade else '❌'}")
+
+                return should_trade, volatility
+
         except Exception as e:
             logger.error(f"Error in market analysis: {e}")
             return False, 0.0
 
-    def adjust_grid_parameters(self, volatility_ratio: float, current_price: float) -> None:
-        """Adjust grid parameters based on market volatility and price"""
+    async def adjust_grid_parameters(self, volatility: float, current_price: float) -> None:
+        """Adjust grid parameters based on volatility"""
         try:
-            # Price-based grid adjustments
-            if current_price >= 20000:  # BTC range
-                self.base_grid_spacing = 0.04    # 4% spacing
-                self.min_profit_threshold = 3.5   # Higher profit needed
-                position_multiplier = 1           # Standard size
-            elif current_price >= 1000:  # ETH range
-                self.base_grid_spacing = 0.035   # 3.5% spacing
-                self.min_profit_threshold = 3.0
-                position_multiplier = 1.5
-            elif current_price >= 100:   # High-value alts
-                self.base_grid_spacing = 0.03    # 3% spacing
-                self.min_profit_threshold = 2.5
-                position_multiplier = 2
-            elif current_price >= 10:    # Mid-value alts
-                self.base_grid_spacing = 0.025   # 2.5% spacing
-                self.min_profit_threshold = 2.0
-                position_multiplier = 3
-            elif current_price >= 1:     # Low-value alts
-                self.base_grid_spacing = 0.02    # 2% spacing
-                self.min_profit_threshold = 1.5
-                position_multiplier = 4
-            else:                        # Micro-price alts
-                self.base_grid_spacing = 0.015   # 1.5% spacing
-                self.min_profit_threshold = 1.0
-                position_multiplier = 5
+            logger.info(f"\n{'='*30}")
+            logger.info("ADJUSTING GRID PARAMETERS")
+            logger.info(f"{'='*30}")
+            logger.info(f"Current volatility: {volatility:.2f}%")
+            
+            # Base grid levels on volatility ranges
+            if volatility < 1.0:  # Low volatility
+                self.grid_levels = 3
+                self.grid_spacing = 0.008  # 0.8%
+                logger.info("Low volatility setup - Tighter grids")
+            elif 1.0 <= volatility < 2.0:  # Medium-low volatility
+                self.grid_levels = 4
+                self.grid_spacing = 0.012  # 1.2%
+                logger.info("Medium-low volatility setup")
+            elif 2.0 <= volatility < 3.0:  # Medium volatility
+                self.grid_levels = 5
+                self.grid_spacing = 0.015  # 1.5%
+                logger.info("Medium volatility setup")
+            elif 3.0 <= volatility < 4.0:  # Medium-high volatility
+                self.grid_levels = 6
+                self.grid_spacing = 0.018  # 1.8%
+                logger.info("Medium-high volatility setup")
+            else:  # High volatility
+                self.grid_levels = 7
+                self.grid_spacing = 0.02  # 2%
+                logger.info("High volatility setup - Wider grids")
 
-            # Adjust grid spacing with volatility
-            new_spacing = self.base_grid_spacing * volatility_ratio
-            self.grid_spacing = max(self.min_grid_spacing, min(self.max_grid_spacing, new_spacing))
+            # Adjust for minimum profitability
+            min_profit_needed = self.calculate_total_fees(current_price, self.min_position_size, "BTC/USD") * 2
+            min_grid_spacing = min_profit_needed / current_price
             
-            # Adjust grid levels based on price range and volatility
-            if current_price < 1:
-                base_levels = max(4, min(8, self.grid_levels))  # More levels for cheaper coins
-            else:
-                base_levels = self.grid_levels
-                
-            self.grid_levels = max(3, min(8, int(base_levels * volatility_ratio)))
+            if self.grid_spacing < min_grid_spacing:
+                self.grid_spacing = min_grid_spacing
+                logger.info(f"Adjusted grid spacing to ensure profitability: {self.grid_spacing*100:.2f}%")
+
+            # Update class attribute instead of local variable
+            self.min_position_size = 0.001 if current_price >= 20000 else 0.01
             
-            logger.info(f"Adjusted parameters for price ${current_price:.4f}:")
-            logger.info(f"Grid Spacing: {self.grid_spacing:.4f}")
-            logger.info(f"Grid Levels: {self.grid_levels}")
-            logger.info(f"Position Multiplier: {position_multiplier}x")
-            logger.info(f"Min Profit Threshold: ${self.min_profit_threshold}")
-            
+            logger.info(f"Final grid spacing: {self.grid_spacing*100:.2f}%")
+            logger.info(f"Minimum position size: {self.min_position_size}")
+            logger.info(f"{'='*30}\n")
+
+            return True
+
         except Exception as e:
             logger.error(f"Error adjusting grid parameters: {e}")
+            return False
+            
 
     async def update_performance_metrics(self, trade_result: float) -> None:
         """Update strategy performance metrics with enhanced risk monitoring"""
@@ -1053,7 +1005,7 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.error(f"Error validating profitability: {e}")
             return False
-
+        
     async def execute_grid_orders(self, symbol: str, force_create: bool = False) -> None:
         """Execute grid orders with fee validation"""
         try:
@@ -1066,6 +1018,21 @@ class KrakenAdvancedGridStrategy:
                 logger.warning(f"❌ No historical data for {symbol}")
                 return
 
+            # Calculate volatility with default fallback
+            try:
+                volatility = await self.calculate_volatility(df)
+                if volatility is None:
+                    volatility = 2.0  # Default moderate volatility
+                    logger.warning(f"Using default volatility of {volatility}%")
+            except Exception as e:
+                volatility = 2.0
+                logger.error(f"Error calculating volatility: {e}")
+
+            current_price = float(df['close'].iloc[-1])
+            
+            # Make sure adjust_grid_parameters is async
+            await self.adjust_grid_parameters(volatility, current_price)
+
             # First verify if this is a spot position
             try:
                 balance = await self.exchange.fetch_balance()
@@ -1077,7 +1044,14 @@ class KrakenAdvancedGridStrategy:
                 logger.error(f"Error checking spot balance: {e}")
                 is_spot = False
 
-             # Get multi-timeframe trend analysis
+            # If position exists, use manage_stop_loss instead of direct execution
+            if symbol in self.active_positions:
+                position = self.active_positions[symbol]
+                current_price = await self.get_current_price(symbol)
+                await self.manage_stop_loss(symbol, position, current_price)
+                return
+
+            # Get multi-timeframe trend analysis
             trend_data = await self.analyze_multi_timeframe_trend(symbol)
             
             # Log trend analysis
@@ -1352,6 +1326,7 @@ class KrakenAdvancedGridStrategy:
                 
         except Exception as e:
             logger.error(f"❌ Error executing grid orders: {e}")
+            traceback.print_exc()
 
     async def get_current_price(self, symbol: str) -> float:
         """Get current price using last trade price with bid/ask spread awareness"""
@@ -1497,6 +1472,11 @@ class KrakenAdvancedGridStrategy:
     async def manage_stop_loss(self, symbol: str, position: Dict, current_price: float) -> None:
         """Manage stop loss and take profits for both spot and margin positions"""
         try:
+            # Add this debug log at start
+            logger.info(f"🏁 STARTING STOP LOSS MANAGEMENT FOR {symbol}")
+            logger.debug(f"Position data: {position}")
+            logger.debug(f"Current price: {current_price}")
+
             # Get position details
             entry_price = float(position['info']['price'])
             position_side = position['info'].get('side', 'long')  # Default to 'long' for spot
@@ -1849,7 +1829,8 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"Trailing: {'✅' if position_data.get('trailing_active') else '⏳'}")
 
         except Exception as e:
-            logger.error(f"Error in manage_stop_loss for {symbol}: {e}")
+            logger.error(f"Critical error in stop management: {e}")
+            logger.error(traceback.format_exc())
 
     async def execute_take_profit(self, symbol: str, position_side: str, size: float, price: float, tp_type: str, is_spot: bool = False) -> bool:
         """Execute a take profit order with retries and confirmation"""
@@ -1969,7 +1950,7 @@ class KrakenAdvancedGridStrategy:
         return False
 
     async def monitor_positions(self, symbols: List[str] = None) -> None:
-        """Monitor positions with accurate price tracking"""
+        """Monitor positions with accurate price tracking and stop loss execution"""
         try:
             logger.info("\n=== MONITORING POSITIONS ===")
             
@@ -1984,7 +1965,7 @@ class KrakenAdvancedGridStrategy:
                     ticker = await self.exchange.fetch_ticker(symbol)
                     current_price = float(ticker['last'])
                     
-                    # Call manage_stop_loss with verified position data
+                    # First manage stop loss levels
                     await self.manage_stop_loss(
                         symbol=symbol,
                         position=position,
@@ -1997,7 +1978,7 @@ class KrakenAdvancedGridStrategy:
                     logger.error(f"Error monitoring {symbol}: {e}")
                     continue
                     
-            logger.error("=== FINISHED POSITION MONITORING ===\n")
+            logger.info("=== FINISHED POSITION MONITORING ===\n")
             
         except Exception as e:
             logger.error(f"Position monitoring error: {e}")
@@ -2129,9 +2110,8 @@ class KrakenAdvancedGridStrategy:
                         # Get both spot and futures positions
                         positions = await self.verify_actual_positions()
                         
-                        # Update active positions
-                        for pos in positions:
-                            symbol = pos['symbol']
+                        # Update active positions - using .items() since positions is now a dictionary
+                        for symbol, pos in positions.items():
                             if symbol not in self.active_positions:
                                 # Get entry price from order history
                                 try:
@@ -2165,6 +2145,20 @@ class KrakenAdvancedGridStrategy:
                             logger.info("No active positions to monitor")
                         logger.info("=== FINISHED POSITION MONITORING ===\n")
                         
+                        # Manage stop losses for active positions
+                        for symbol, position in positions.items():
+                            if symbol in self.active_positions:
+                                current_price = await self.get_current_price(symbol)
+                                await self.manage_stop_loss(symbol, position, current_price)
+                        
+                        # Existing grid logic
+                        for symbol in self.active_symbols:
+                            try:
+                                await self.execute_grid_orders(symbol)
+                            except Exception as e:
+                                logger.error(f"Error executing grid orders for {symbol}: {e}")
+                                continue
+                        
                         # Update and process trading symbols
                         await self.update_trading_symbols()
                         for symbol in self.active_symbols:
@@ -2181,7 +2175,7 @@ class KrakenAdvancedGridStrategy:
                                 logger.error(f"Error processing symbol {symbol}: {e}")
                                 continue
                             
-                        await asyncio.sleep(5)  # 5-second interval
+                        await asyncio.sleep(60)  # Changed to 60-second interval
                         
                     except ccxt.RequestTimeout:
                         logger.warning("Timeout in main loop, continuing...")
@@ -4138,7 +4132,7 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error validating grid order size: {e}")
             return size  # Return original size if validation fails
 
-    async def verify_actual_positions(self) -> List[Dict]:
+    async def verify_actual_positions(self) -> Dict[str, Dict]:
         """Verify actual positions vs open orders with precise FIFO tracking"""
         try:
             balance = await self.exchange.fetch_balance()
@@ -4148,7 +4142,7 @@ class KrakenAdvancedGridStrategy:
             symbol_map = {m['base'].replace('XBT','BTC').replace('XX','').replace('Z','').replace('.S',''): m['symbol'] 
                          for m in markets if m['quote'] == 'USD' and '/USD' in m['symbol']}
 
-            actual_positions = []
+            actual_positions = {}  # Changed to dictionary
             for currency, amount in balance.get('total', {}).items():
                 clean_currency = currency.replace('XBT','BTC').replace('XX','').replace('Z','').replace('.S','')
                 
@@ -4209,6 +4203,10 @@ class KrakenAdvancedGridStrategy:
                             }
                         }
                         
+                        # Add debug logging here
+                        logger.debug(f"Position type: {type(position)}")
+                        logger.debug(f"Position data: {position}")
+                        
                         # Update both tracking systems with complete fields
                         self.active_positions[proper_symbol] = position
                         self.positions[proper_symbol] = {
@@ -4227,18 +4225,30 @@ class KrakenAdvancedGridStrategy:
                             'spot_balance': total_amount
                         }
                         
-                        actual_positions.append(position)
+                        actual_positions[proper_symbol] = position  # Changed to dictionary assignment
                         logger.info(f"Verified position: {proper_symbol} - Entry: {entry_price:.6f}")
                         
                     except Exception as e:
                         logger.error(f"Position error {clean_currency}: {str(e)[:100]}")
                         continue
 
+            # Add validation before returning
+            if not actual_positions:
+                logger.info("No active positions found")
+                return {}  # Return empty dict instead of empty list
+                
+            # Add detailed debug logging here
+            logger.debug(f"Final positions type: {type(actual_positions)}")
+            for sym, pos in actual_positions.items():
+                logger.debug(f"Position for {sym} - Type: {type(pos)}")
+                logger.debug(f"Position data: {pos}")
+            
+            logger.debug(f"Verified positions: {actual_positions}")
             return actual_positions
 
         except Exception as e:
             logger.error(f"Position verification failed: {e}")
-            return []
+            return {}  # Return empty dict on error
 
     async def _check_resistance_levels(self, symbol, current_price):
         """Check if current price is near any resistance level"""
@@ -4421,6 +4431,48 @@ class KrakenAdvancedGridStrategy:
             
         except Exception as e:
             logger.error(f"Grid refresh error: {e}")
+
+    async def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
+        """Calculate recent volatility using multiple methods"""
+        try:
+            # Calculate different volatility metrics
+            
+            # 1. Traditional volatility (standard deviation of returns)
+            returns = df['close'].pct_change()
+            trad_vol = returns.std() * np.sqrt(252) * 100  # Annualized and converted to percentage
+            
+            # 2. True Range based volatility
+            high_low = df['high'] - df['low']
+            high_close = np.abs(df['high'] - df['close'].shift())
+            low_close = np.abs(df['low'] - df['close'].shift())
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = tr.rolling(window).mean()
+            atr_vol = (atr.iloc[-1] / df['close'].iloc[-1]) * 100  # Convert to percentage
+            
+            # 3. Parkinson volatility (uses high-low range)
+            hl_vol = np.sqrt(1/(4*np.log(2)) * 
+                            ((np.log(df['high']/df['low'])**2)
+                             .rolling(window)
+                             .mean())) * np.sqrt(252) * 100
+            
+            # Combine volatility metrics with weights
+            combined_vol = (
+                0.4 * trad_vol +      # Traditional volatility (40% weight)
+                0.4 * atr_vol +       # ATR-based volatility (40% weight)
+                0.2 * hl_vol.iloc[-1] # Parkinson volatility (20% weight)
+            )
+            
+            logger.info(f"\nVolatility Analysis:")
+            logger.info(f"Traditional Vol: {trad_vol:.2f}%")
+            logger.info(f"ATR-based Vol: {atr_vol:.2f}%")
+            logger.info(f"Parkinson Vol: {hl_vol.iloc[-1]:.2f}%")
+            logger.info(f"Combined Vol: {combined_vol:.2f}%")
+            
+            return combined_vol
+
+        except Exception as e:
+            logger.error(f"Error calculating volatility: {e}")
+            return 2.0  # Return a default moderate volatility
 
 if __name__ == "__main__":
     try:
