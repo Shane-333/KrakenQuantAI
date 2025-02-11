@@ -23,8 +23,8 @@ class KrakenAdvancedGridStrategy:
     def __init__(self, demo_mode=False):  # Set default to False for live
         self.demo_mode = demo_mode
         self.STABLE_BLACKLIST = {
-        'EUR/USD', 'USDC/USD', 'USDT/USD', 'AUD/USD',
-        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD', 'AUD/USD:USD'
+        'EUR/USD', 'USDC/USD', 'USDT/USD', 'AUD/USD', 'FARTCOIN/USD', 'PEPE/USD', 'BONK/USD', 'SHIB/USD'
+        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD', 'AUD/USD:USD', 'FARTCOIN/USD:USD', 'PEPE/USD:USD', 'BONK/USD:USD', 'SHIB/USD:USD'
         }
 
         
@@ -442,12 +442,12 @@ class KrakenAdvancedGridStrategy:
                 
                 min_sentiment = 0.55 if market_state == "bear" else 0.6
                 rsi_floor = 35 if market_state == "bear" else 30
-                max_volatility = 0.4 if market_state == "bear" else 0.6
+                max_volatility = 40 if market_state == "bear" else 60  # Allow higher volatility (40-60%)
             else:
                 logger.warning("Using default thresholds - insufficient daily data")
                 min_sentiment = 0.6
                 rsi_floor = 30
-                max_volatility = 0.6
+                max_volatility = 50  # Higher default volatility threshold
 
             if not self.has_sufficient_funds and symbol not in self.active_positions:
                 return False, 0.0
@@ -3615,13 +3615,13 @@ class KrakenAdvancedGridStrategy:
             df['ema9'] = talib.EMA(df['close'], 9)
             df['ema21'] = talib.EMA(df['close'], 21)
             
-
-            # Immediate trend requirements
+            # More lenient trend requirements - either crossing or trending up
             current_above = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
             prev_below = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
-            ema_bullish = current_above and prev_below
+            ema_trending_up = df['ema9'].iloc[-1] > df['ema9'].iloc[-2]
+            ema_bullish = (current_above and prev_below) or ema_trending_up
             
-            # Momentum confirmation with enhanced MACD check
+            # Relaxed MACD conditions
             macd_line, signal_line, _ = talib.MACD(
                 df['close'],
                 fastperiod=self.macd_fast,
@@ -3630,69 +3630,50 @@ class KrakenAdvancedGridStrategy:
             )
             histogram = macd_line - signal_line
             macd_bullish = (
-                (macd_line.iloc[-1] > signal_line.iloc[-1]) and
-                (histogram.iloc[-1] > histogram.iloc[-2]) and  # Histogram increasing
-                (macd_line.iloc[-1] > 0)  # Require MACD above zero line
+                (macd_line.iloc[-1] > signal_line.iloc[-1]) or  # Either crossing
+                (histogram.iloc[-1] > histogram.iloc[-2])        # Or gaining momentum
             )
             
-            # Add reversal confirmation
+            # Relaxed RSI conditions
             rsi = talib.RSI(df['close'], 14).iloc[-1]
             rsi_prev = talib.RSI(df['close'], 14).iloc[-2]
-            rsi_bullish = (rsi > 30) and (rsi_prev <= 30)  # Cross above oversold
+            rsi_bullish = (rsi > rsi_prev) and (rsi < 70)  # Just trending up and not overbought
             
-
-            # Strengthen MACD check
-            macd_rising = (macd_line.iloc[-1] > macd_line.iloc[-2])  # MACD histogram rising
-            
-            # Volume spike check with NaN handling
+            # Volume validation with lower threshold
             current_volume = df['volume'].iloc[-1]
+            vol_ma = df['volume'].rolling(20, min_periods=1).mean().iloc[-1]
+            volume_spike = current_volume > vol_ma * 1.1  # Reduced from 1.3
             
-            # Handle empty/invalid volume data
-            if len(df) < 20 or df['volume'].isnull().all():
-                vol_ma = current_volume  # Fallback to current volume
-            else:
-                vol_ma = df['volume'].rolling(20, min_periods=1).mean().iloc[-1]
-            
-            volume_spike = current_volume > vol_ma * 1.3
-            
-            # Calculate ATR before logging
+            # Wider ATR range
             current_price = df['close'].iloc[-1]
             atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
+            valid_atr = 0.01 <= (atr/current_price) <= 0.04  # Wider range 1-4%
             
-            # Now safe to log both values
-            volume_ratio = current_volume / vol_ma if (vol_ma > 0 and not pd.isna(vol_ma)) else 0
-            logger.info(f"Volume: {volume_ratio:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
-
-            # Volatility filter (aligned with line 3784-3791)
-            valid_atr = 0.015 <= (atr/current_price) <= 0.03  # 1.5-3% range
-            
-            # Support alignment (using 15m levels from line 830-833)
+            # Support check with wider threshold
             _, fifteen_m_supports = await self.calculate_support_resistance(df, symbol)
-            near_support = any(abs(current_price - s)/s < 0.005 for s in fifteen_m_supports[:3])
+            near_support = any(abs(current_price - s)/s < 0.008 for s in fifteen_m_supports[:3])
             
-            # Bullish candle pattern
+            # More lenient candle pattern
             last_candle = df.iloc[-1]
-            bullish_candle = (last_candle['close'] > last_candle['open']) and \
-                            ((last_candle['high'] - last_candle['low'])/current_price > 0.01)
+            bullish_candle = last_candle['close'] > last_candle['open']  # Just needs to be green
             
+            # Logging
             logger.info(f"\n5M Analysis for {symbol}:")
-            logger.info(f"EMA Cross: {'✅' if ema_bullish else '❌'} | MACD: {'✅' if macd_bullish else '❌'}")
+            logger.info(f"EMA Cross/Trend: {'✅' if ema_bullish else '❌'} | MACD: {'✅' if macd_bullish else '❌'}")
             logger.info(f"Volume: {current_volume/vol_ma:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
-            logger.info(f"Near 15m Support: {'✅' if near_support else '❌'} | Bullish Candle: {'✅' if bullish_candle else '❌'}")
-            logger.info(f"Reversal Confirmation:")
-            logger.info(f"RSI Cross >30: {'✅' if rsi_bullish else '❌'} ({rsi_prev:.1f} → {rsi:.1f})")
-            logger.info(f"MACD Rising: {'✅' if macd_rising else '❌'}")
+            logger.info(f"Near Support: {'✅' if near_support else '❌'} | Bullish Candle: {'✅' if bullish_candle else '❌'}")
+            logger.info(f"RSI Trend Up: {'✅' if rsi_bullish else '❌'} ({rsi_prev:.1f} → {rsi:.1f})")
 
-            return all([
-                ema_bullish,
-                macd_bullish,
-                macd_rising,  # New condition
-                rsi_bullish,  # New condition
-                volume_spike,
-                valid_atr,
-                near_support,
-                bullish_candle
-            ])
+            # Need fewer conditions to be true
+            required_conditions = [
+                ema_bullish or macd_bullish,  # Either EMA or MACD is bullish
+                rsi_bullish,                  # RSI trending up
+                volume_spike,                 # Decent volume
+                valid_atr,                    # Reasonable volatility
+                near_support or bullish_candle # Either near support or bullish candle
+            ]
+            
+            return sum(required_conditions) >= 4  # Need 4 out of 5 conditions
             
         except Exception as e:
             logger.error(f"5M analysis error: {e}")
