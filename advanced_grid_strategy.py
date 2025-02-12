@@ -1138,13 +1138,12 @@ class KrakenAdvancedGridStrategy:
                     price_val, confidence = price
                     normalized_prices.append((float(price_val), float(confidence)))
                 elif isinstance(price, (float, np.float64)):
-                    # Handle case where price is a single value
                     normalized_prices.append((float(price), 1.0))
                 else:
                     logger.warning(f"Skipping invalid price format: {price}")
                     continue
 
-            # Normalize and validate grid prices in one pass
+            # Determine the maximum confidence value
             max_confidence = max((conf for _, conf in normalized_prices), default=0)
 
             # Initialize valid grids list and confidence map
@@ -1156,11 +1155,11 @@ class KrakenAdvancedGridStrategy:
             price_change = (df['close'].iloc[-1] - df['close'].iloc[-20]) / df['close'].iloc[-20]
             recent_volume = df['volume'].tail(20).mean()
             current_volume = df['volume'].iloc[-1]
-            volume_confirmed = current_volume > recent_volume * 0.1  # Reduce to 10%
+            volume_confirmed = current_volume > recent_volume * 0.1  # Reduced to 10%
 
-            # Handle single float values in grid_prices
+            # Evaluate candidate grid prices
             for price_item in grid_prices:
-                # Convert price to float and assign default confidence
+                # Convert price to float and assign default confidence if needed
                 if isinstance(price_item, (np.float64, float)):
                     price_obj = float(price_item)
                     raw_confidence = 1.0
@@ -1170,8 +1169,8 @@ class KrakenAdvancedGridStrategy:
                 
                 # Normalize confidence
                 if max_confidence > 0:
-                    normalized_confidence = (raw_confidence / max_confidence) * 100  # Scale to 0-100 instead of 0-10
-                    if normalized_confidence < 70:  # Require 70% of max confidence
+                    normalized_confidence = (raw_confidence / max_confidence) * 100  # Scale to 0-100
+                    if normalized_confidence < 70:  # Require at least 70% of max confidence
                         logger.info(f"Skipping price {price_obj} - confidence too low: {normalized_confidence:.2f}")
                         continue
                 else:
@@ -1179,8 +1178,6 @@ class KrakenAdvancedGridStrategy:
                 
                 # Define minimum distance between grids
                 min_distance = current_price * 0.02
-
-                # Check minimum distance from previous grid
                 if previous_price and abs(price_obj - previous_price) < min_distance:
                     logger.info(f"Skipping price {price_obj} - too close to previous grid at {previous_price}")
                     continue
@@ -1189,29 +1186,38 @@ class KrakenAdvancedGridStrategy:
                 is_near_support = any(abs(price_obj - s) / s <= 0.01 for s in support_levels)
                 is_near_resistance = any(abs(price_obj - r) / r <= 0.01 for r in resistance_levels)
                 
-                # Calculate price change and momentum
+                # Determine intended trade side
                 would_be_side = "buy" if price_obj < current_price else "sell"
                 momentum_aligned = (price_change > 0 and price_obj > current_price) or \
                                  (price_change < 0 and price_obj < current_price)
 
-                # Adjust validation requirements
+                # Compute technical indicators
                 rsi = talib.RSI(df['close'], 14).iloc[-1]  
-                macd_indicator = talib.trend.MACD(df['close'])
-                macd_line = macd_indicator.macd()
-                signal_line = macd_indicator.macd_signal()
-                histogram = macd_indicator.macd_diff()
+                macd_line, signal_line, histogram = talib.MACD(
+                    df['close'], 
+                    fastperiod=self.macd_fast,
+                    slowperiod=self.macd_slow,
+                    signalperiod=self.macd_signal
+                )
                 macd_bullish = (
                     (macd_line.iloc[-1] > signal_line.iloc[-1]) and
                     (histogram.iloc[-1] > histogram.iloc[-2]) and
                     (macd_line.iloc[-1] > 0)
                 )
-                valid_for_trade = (
-                    (momentum_aligned or volume_confirmed) and  # AND instead of OR
-                    (
+                
+                # Update S/R condition: enforce for buys that the price is near support AND NOT near resistance,
+                # and for sells the opposite.
+                if would_be_side == "buy":
+                    valid_sr = is_near_support and (not is_near_resistance)
+                    valid_rsi = rsi < 35
+                else:
+                    valid_sr = is_near_resistance and (not is_near_support)
+                    valid_rsi = rsi > 65
 
-                        (would_be_side == "buy" and is_near_support and rsi < 35) or
-                        (would_be_side == "sell" and is_near_resistance and rsi > 65)
-                    ) and 
+                valid_for_trade = (
+                    (momentum_aligned or volume_confirmed) and
+                    valid_sr and
+                    valid_rsi and 
                     macd_bullish and  
                     normalized_confidence > 8
                 )
@@ -1226,7 +1232,7 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"\n❌ Rejected {price_obj} due to:")
                     logger.info(f"Volume confirmed: {volume_confirmed}")
                     logger.info(f"Momentum aligned: {momentum_aligned}")
-                    logger.info(f"Side: {would_be_side}")
+                    logger.info(f"Intended side: {would_be_side}")
                     logger.info(f"Near support: {is_near_support}")
                     logger.info(f"Near resistance: {is_near_resistance}")
 
@@ -1255,8 +1261,7 @@ class KrakenAdvancedGridStrategy:
                         else:
                             logger.info(f"❌ Skipping sell order at ${price:.4f} - No spot position")
                             continue
-                    else:  # For buys in spot
-                        # Check USD balance using the existing logic
+                    else:  # For buys in spot - check USD balance
                         pass
                 
                 # Get relevant S/R levels based on order side
@@ -1270,15 +1275,12 @@ class KrakenAdvancedGridStrategy:
                     max_distance = 0.008  # 0.8% from resistance
 
                 # Check proximity to relevant S/R
-                near_level = any(abs(price - level)/level < max_distance 
-                                for level in relevant_levels[:3])
-                
+                near_level = any(abs(price - level) / level < max_distance for level in relevant_levels[:3])
                 if not near_level:
                     logger.info(f"Skipping {side} order at {price} - not near {level_type}")
                     continue
                 
                 logger.info(f"\nValidating {side.upper()} order at ${price:.4f}")
-                
                 if abs(price - current_price) < min_buffer:
                     logger.info(f"❌ Skipping - too close to current price (buffer: ${min_buffer:.4f})")
                     continue
@@ -1309,13 +1311,10 @@ class KrakenAdvancedGridStrategy:
                     continue
                 
                 try:
-                    # Modify the order parameters to use Kraken's specific flags
                     order_params = {
                         'trading_agreement': 'agree',
-                        'oflags': 'post'  # This is Kraken's way of setting post-only orders
+                        'oflags': 'post'
                     }
-                    
-                    # Log the exact order parameters
                     logger.info(f"Attempting to place order with params:")
                     logger.info(f"Symbol: {symbol}")
                     logger.info(f"Type: limit")
@@ -1346,10 +1345,8 @@ class KrakenAdvancedGridStrategy:
                         logger.info(f"✅ Successfully placed {side} order at {price} for {size} {symbol}")
                         logger.info(f"Order ID: {order['id']}")
                     
-                    # Refresh grid levels after each trade
                     await self.refresh_grid_levels(symbol)
-                    
-                    await asyncio.sleep(0.1)  # Rate limiting between orders
+                    await asyncio.sleep(0.1)
                     
                 except Exception as e:
                     logger.error(f"Order placement failed for {symbol} at {price}: {str(e)}")
@@ -1523,14 +1520,24 @@ class KrakenAdvancedGridStrategy:
             # Convert to proper precision
             size = round(float(size), precision)
             
-            # Spot balance check
+            # Spot balance check - FIXED VERSION
             if self.is_spot:
-                asset = symbol.split('/')[0]
-                available = float(balance.get(asset, {}).get('free', 0))
-                if available < size:
-                    logger.warning(f"⚠️ Adjusting size to available {asset} balance: {available}")
-                    size = min(size, available)
-            
+                # For BUY orders: check QUOTE currency balance (USD)
+                # For SELL orders: check BASE currency balance (POPCAT)
+                _, quote_currency = symbol.split('/')
+                available_quote = float(balance.get(quote_currency, {}).get('free', 0))
+                
+                # Calculate maximum buyable with available USD
+                max_buyable = available_quote / current_price
+                if size > max_buyable:
+                    logger.warning(f"⚠️ Adjusting size to available USD balance: ${available_quote:.2f}")
+                    size = max_buyable
+                
+                # Now check if this adjusted size meets minimums
+                if size < min_size:
+                    logger.error(f"❌ USD balance too low for minimum {symbol} order")
+                    return 0.0
+
             # Final validation
             final_usd_cost = size * current_price
             available_usd = float(balance.get(quote_currency, {}).get('free', 0))
