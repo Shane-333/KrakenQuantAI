@@ -188,8 +188,8 @@ class KrakenAdvancedGridStrategy:
         self.min_position_size = 0.01  # Default value
 
         # Initialize risk management parameters
-        self.risk_per_trade = 0.05  # 10% 
-        self.max_portfolio_risk = 0.15  # 10% default
+        self.risk_per_trade = 0.01 
+        self.max_portfolio_risk = 0.20  # 10% default
         logger.info(f"Strategy initialized with risk_per_trade={self.risk_per_trade*100}%")
 
     def initialize_exchange(self) -> None:
