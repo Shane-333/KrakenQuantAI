@@ -23,8 +23,8 @@ class KrakenAdvancedGridStrategy:
     def __init__(self, demo_mode=False):  # Set default to False for live
         self.demo_mode = demo_mode
         self.STABLE_BLACKLIST = {
-        'EUR/USD', 'USDC/USD', 'USDT/USD', 'AUD/USD', 'FARTCOIN/USD', 'PEPE/USD', 'BONK/USD', 'SHIB/USD'
-        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD', 'AUD/USD:USD', 'FARTCOIN/USD:USD', 'PEPE/USD:USD', 'BONK/USD:USD', 'SHIB/USD:USD'
+        'EUR/USD', 'USDC/USD', 'USDT/USD', 'AUD/USD', 'FARTCOIN/USD', 'PEPE/USD', 'BONK/USD', 'SHIB/USD', 'GBP/USD', 'JPY/USD', 'CHF/USD', 'NZD/USD', 'CAD/USD', 'HKD/USD', 'SGD/USD', 'NOK/USD', 'SEK/USD', 'AUD/JPY', 'NZD/JPY', 'CAD/JPY', 'HKD/JPY', 'SGD/JPY', 'NOK/JPY', 'SEK/JPY'
+        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD', 'AUD/USD:USD', 'FARTCOIN/USD:USD', 'PEPE/USD:USD', 'BONK/USD:USD', 'SHIB/USD:USD', 'GBP/USD:USD', 'JPY/USD:USD', 'CHF/USD:USD', 'NZD/USD:USD', 'CAD/USD:USD', 'HKD/USD:USD', 'SGD/USD:USD', 'NOK/USD:USD', 'SEK/USD:USD', 'AUD/JPY:USD', 'NZD/JPY:USD', 'CAD/JPY:USD', 'HKD/JPY:USD', 'SGD/JPY:USD', 'NOK/JPY:USD', 'SEK/JPY:USD'
         }
 
         
@@ -186,6 +186,11 @@ class KrakenAdvancedGridStrategy:
 
         # Add this line to initialize the attribute
         self.min_position_size = 0.01  # Default value
+
+        # Initialize risk management parameters
+        self.risk_per_trade = 0.05  # 10% 
+        self.max_portfolio_risk = 0.15  # 10% default
+        logger.info(f"Strategy initialized with risk_per_trade={self.risk_per_trade*100}%")
 
     def initialize_exchange(self) -> None:
         """Initialize CCXT exchange connection"""
@@ -1094,7 +1099,7 @@ class KrakenAdvancedGridStrategy:
                 return
                 
             # Adjust grid parameters based on volatility
-            self.adjust_grid_parameters(volatility, float(df['close'].iloc[-1]))
+            await self.adjust_grid_parameters(volatility, float(df['close'].iloc[-1]))
             logger.info(f"Grid parameters adjusted for volatility: {volatility:.2f}%")
 
             logger.info(f"🔍 Checking existing orders for {symbol}")
@@ -1236,9 +1241,40 @@ class KrakenAdvancedGridStrategy:
             for price in valid_grids:
                 side = "buy" if price < current_price else "sell"
                 
-                # Skip sell orders for spot positions
-                if is_spot and side == "sell":
-                    logger.info(f"❌ Skipping sell order at ${price:.4f} - Spot position")
+                # Handle spot position logic
+                if is_spot:
+                    if side == "sell":
+                        # Only allow sells if we have a position
+                        if symbol in self.positions and self.positions[symbol]['size'] > 0:
+                            # Verify actual spot balance
+                            asset = symbol.split('/')[0]
+                            spot_balance = (await self.exchange.fetch_balance()).get(asset, {}).get('free', 0)
+                            if spot_balance < size:
+                                logger.info(f"❌ Insufficient {asset} balance for sell order: {spot_balance} < {size}")
+                                continue
+                        else:
+                            logger.info(f"❌ Skipping sell order at ${price:.4f} - No spot position")
+                            continue
+                    else:  # For buys in spot
+                        # Check USD balance using the existing logic
+                        pass
+                
+                # Get relevant S/R levels based on order side
+                if side == "buy":
+                    relevant_levels = support_levels
+                    level_type = "support"
+                    max_distance = 0.01  # 1% from support
+                else:
+                    relevant_levels = resistance_levels 
+                    level_type = "resistance"
+                    max_distance = 0.008  # 0.8% from resistance
+
+                # Check proximity to relevant S/R
+                near_level = any(abs(price - level)/level < max_distance 
+                                for level in relevant_levels[:3])
+                
+                if not near_level:
+                    logger.info(f"Skipping {side} order at {price} - not near {level_type}")
                     continue
                 
                 logger.info(f"\nValidating {side.upper()} order at ${price:.4f}")
@@ -1442,31 +1478,75 @@ class KrakenAdvancedGridStrategy:
             return []
 
     async def calculate_position_size(self, current_price: float, symbol: str) -> float:
-        """Safe position sizing with error handling"""
+        """Safe position sizing with USD balance check for spot buys"""
         try:
-            if current_price <= 0:
-                logger.error(f"Invalid price {current_price} for {symbol}")
-                return 0.0
-                
-            # Get verified balance (matches line 460-472 fix)
+            # Split symbol into base/quote currencies (e.g. POPCAT/USD)
+            base_currency, quote_currency = symbol.split('/')
+            
+            market = self.exchange.market(symbol)
+            min_size = float(market['limits']['amount']['min'])
+            precision = int(market['precision']['amount'])
+            
+            # Get balances
             balance = await self.exchange.fetch_balance()
-            asset = symbol.split('/')[0]
-            spot_balance = float(balance.get(asset, {}).get('free', 0)) + \
-                           float(balance.get(asset, {}).get('used', 0))
+            portfolio_value = float(balance['total']['USD'])
             
-            if spot_balance <= 0:
-                logger.warning(f"No {asset} balance for {symbol}")
+            # Check minimum required capital in USD
+            min_usd_required = min_size * current_price
+            if portfolio_value < min_usd_required:
+                logger.warning(f"❌ Insufficient USD capital for {symbol}")
+                logger.warning(f"Need ${min_usd_required:.2f}, have ${portfolio_value:.2f}")
                 return 0.0
                 
-            # Risk management (1% of portfolio per trade)
-            portfolio_value = float(balance['total']['USD'])
-            position_size = (portfolio_value * 0.01) / current_price
+            # Calculate max USD to risk
+            risk_usd = min(
+                portfolio_value * self.risk_per_trade,
+                float(balance.get(quote_currency, {}).get('free', 0))  # Available USD
+            )
             
-            logger.info(f"Position size calc: {portfolio_value=}, {current_price=}, {position_size=}")
-            return round(position_size, 4)
+            # Convert USD risk to base currency size
+            size = risk_usd / current_price
+            
+            # Enforce minimum size after USD conversion
+            if size < min_size:
+                logger.warning(f"⚠️ Increasing size to meet {symbol} minimum {min_size}")
+                adjusted_size = min_size * 1.01  # Add 1% buffer
+                
+                # Validate adjusted USD risk
+                adjusted_usd_risk = adjusted_size * current_price
+                if adjusted_usd_risk > (portfolio_value * self.max_risk_per_trade):
+                    logger.warning(f"❌ Minimum size exceeds max USD risk (${adjusted_usd_risk:.2f})")
+                    return 0.0
+                    
+                size = adjusted_size
+            
+            # Convert to proper precision
+            size = round(float(size), precision)
+            
+            # Spot balance check
+            if self.is_spot:
+                asset = symbol.split('/')[0]
+                available = float(balance.get(asset, {}).get('free', 0))
+                if available < size:
+                    logger.warning(f"⚠️ Adjusting size to available {asset} balance: {available}")
+                    size = min(size, available)
+            
+            # Final validation
+            final_usd_cost = size * current_price
+            available_usd = float(balance.get(quote_currency, {}).get('free', 0))
+            if final_usd_cost > available_usd:
+                logger.warning(f"⚠️ Adjusting size to available USD balance: ${available_usd:.2f}")
+                size = available_usd / current_price
+                
+            if size < min_size:
+                logger.error(f"❌ Final size {size:.4f} {base_currency} still below minimum")
+                return 0.0
+                
+            logger.info(f"✅ Valid buy size: {size:.4f} {base_currency} (${final_usd_cost:.2f} USD)")
+            return round(size, precision)
             
         except Exception as e:
-            logger.error(f"Position size error: {e}")
+            logger.error(f"❌ Position size error: {e}")
             return 0.0
 
     async def manage_stop_loss(self, symbol: str, position: Dict, current_price: float) -> None:
@@ -2914,13 +2994,15 @@ class KrakenAdvancedGridStrategy:
         return expected_profit * safety_margin
 
     async def get_tradeable_instruments(self) -> Dict[str, List[str]]:
-        """Fetch and categorize instruments from Kraken Spot"""
+        """Fetch and categorize instruments with minimum notional validation"""
         try:
-            # Use CCXT to fetch markets and tickers
+            # Get portfolio-based limits
+            balance = await self.exchange.fetch_balance()
+            portfolio_value = float(balance['total']['USD'])
+            max_min_notional = portfolio_value * self.max_risk_per_trade
+            
             markets = await self.exchange.fetch_markets()
             tickers = await self.exchange.fetch_tickers()
-            
-            logger.info(f"Fetched {len(markets)} markets and {len(tickers)} tickers")
             
             categorized_symbols = {
                 'tier1': [],  # $100-500
@@ -2928,58 +3010,80 @@ class KrakenAdvancedGridStrategy:
                 'tier3': [],  # $2000-5000
                 'tier4': []   # $5000+
             }
-            
-            # Process each market
+
             for market in markets:
                 try:
                     symbol = market['symbol']
-                    # Only include USD pairs and spot markets
-                    if not symbol.endswith('/USD') or market.get('type') != 'spot':
+                    
+                    # Filter criteria
+                    if not (symbol.endswith('/USD') and 
+                           market['spot'] and 
+                           market['active'] and
+                           symbol not in self.STABLE_BLACKLIST):
                         continue
-                        
-                    # Get current price from tickers
-                    if symbol in tickers and tickers[symbol].get('last'):
-                        price = float(tickers[symbol]['last'])
-                        
-                        if price > 0:
-                            if price < 500:
-                                categorized_symbols['tier1'].append(symbol)
-                            elif price < 2000:
-                                categorized_symbols['tier2'].append(symbol)
-                            elif price < 5000:
-                                categorized_symbols['tier3'].append(symbol)
-                            else:
-                                categorized_symbols['tier4'].append(symbol)
-                            logger.info(f"Added {symbol} at ${price:.2f}")
-                            
+                    
+                    # Get market details
+                    min_amount = market['limits']['amount']['min']
+                    price = tickers[symbol]['last'] if symbol in tickers else 0
+                    if not price:
+                        continue
+                    
+                    # Calculate minimum notional value
+                    min_notional = min_amount * price
+                    if min_notional > max_min_notional:
+                        logger.info(f"Excluding {symbol} - Min notional ${min_notional:.2f} > Max ${max_min_notional:.2f}")
+                        continue
+                    
+                    # Categorize by price tier
+                    if price < 500:
+                        tier = 'tier1'
+                    elif price < 2000:
+                        tier = 'tier2'
+                    elif price < 5000:
+                        tier = 'tier3'
+                    else:
+                        tier = 'tier4'
+                    
+                    categorized_symbols[tier].append(symbol)
+                    logger.info(f"Approved {symbol} | Price: ${price:.2f} | Min Notional: ${min_notional:.2f}")
+
                 except Exception as e:
-                    logger.error(f"Error processing market {market.get('symbol', 'unknown')}: {e}")
+                    logger.error(f"Error processing {market.get('id', 'unknown')}: {e}")
                     continue
-            
-            # Log the categorization
-            logger.info("\nTradeable Spot Instruments by Tier:")
+
+            # Log final selection
+            logger.info("\nFinal Tradeable Instruments:")
             for tier, symbols in categorized_symbols.items():
-                logger.info(f"\n{tier.upper()} (Count: {len(symbols)}):")
-                for symbol in sorted(symbols):
-                    if symbol in tickers and tickers[symbol].get('last'):
-                        price = float(tickers[symbol]['last'])
-                        logger.info(f"- {symbol} (${price:.2f})")
-            
+                logger.info(f"\n{tier.upper()} ({len(symbols)} symbols):")
+                for sym in sorted(symbols):
+                    if sym in tickers:
+                        price = tickers[sym]['last']
+                        min_amount = next(m['limits']['amount']['min'] for m in markets if m['symbol'] == sym)
+                        logger.info(f"- {sym} | Price: ${price:.2f} | Min Size: {min_amount}")
+
             return categorized_symbols
-            
+
         except Exception as e:
             logger.error(f"Error fetching instruments: {e}")
-            logger.exception("Full traceback:")
-            
-            # Return empty lists if something went wrong
-            return {
-                'tier1': [],
-                'tier2': [],
-                'tier3': [],
-                'tier4': []
-            }
+            return {k: [] for k in ['tier1', 'tier2', 'tier3', 'tier4']}
 
-    async def analyze_multi_timeframe_trend(self, symbol: str) -> dict:
+    async def analyze_multi_timeframe_trend(self, symbol: str, timeframe_results: dict = None) -> dict:
+        """Analyze multi-timeframe trend using pre-calculated results if available"""
+        if timeframe_results:
+            # Use pre-calculated results
+            trend_results = {}
+            
+            # Map timeframe analyses to expected format
+            if '5m' in timeframe_results:
+                trend_results['15m'] = self._format_trend_result(timeframe_results['5m'])
+            if '1h' in timeframe_results:
+                trend_results['1h'] = self._format_trend_result(timeframe_results['1h'])
+            if 'daily' in timeframe_results:
+                trend_results['1d'] = self._format_trend_result(timeframe_results['daily'])
+            
+            return trend_results
+        
+        # Fallback to original calculation if no pre-calculated results
         timeframes = {
             '15m': {'fast_ema': 20, 'slow_ema': 50},
             '1h': {'fast_ema': 50, 'slow_ema': 200},
@@ -3053,6 +3157,21 @@ class KrakenAdvancedGridStrategy:
                 continue
         
         return trend_results
+
+    def _format_trend_result(self, analysis_result: dict) -> dict:
+        """Format individual timeframe analysis into trend result format"""
+        return {
+            'trend': 'bullish' if analysis_result.get('ema_bullish', False) else 'bearish',
+            'strength': analysis_result.get('signal_strength', 0) * 100,
+            'rsi': analysis_result.get('rsi', 50),
+            'macd_hist': analysis_result.get('macd_histogram', 0),
+            'is_oversold': analysis_result.get('rsi', 50) < 30,
+            'is_overbought': analysis_result.get('rsi', 50) > 70,
+            'support_levels': analysis_result.get('support_levels', []),
+            'resistance_levels': analysis_result.get('resistance_levels', []),
+            'near_support': analysis_result.get('near_support', False),
+            'near_resistance': analysis_result.get('near_resistance', False)
+        }
 
     def validate_grid_levels(self, levels: List[dict], trend_data: dict) -> List[dict]:
         """Validate grid levels against trend and Fibonacci"""
@@ -3608,8 +3727,7 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"1H analysis error: {e}")
             return False
 
-    async def _analyze_5m(self, df: pd.DataFrame, symbol: str) -> bool:
-        """5-minute analysis with reversal confirmation"""
+    async def _analyze_5m(self, df: pd.DataFrame, symbol: str) -> Tuple[bool, dict]:
         try:
             # EMA Structure
             df['ema9'] = talib.EMA(df['close'], 9)
@@ -3673,11 +3791,23 @@ class KrakenAdvancedGridStrategy:
                 near_support or bullish_candle # Either near support or bullish candle
             ]
             
-            return sum(required_conditions) >= 4  # Need 4 out of 5 conditions
+            analysis_result = {
+                'ema_bullish': ema_bullish,
+                'macd_bullish': macd_bullish,
+                'rsi': rsi,
+                'macd_histogram': histogram.iloc[-1],
+                'signal_strength': sum(required_conditions) / len(required_conditions),
+                'support_levels': fifteen_m_supports,
+                'near_support': near_support,
+                'volume_spike': volume_spike,
+                'valid_atr': valid_atr
+            }
+            
+            return sum(required_conditions) >= 4, analysis_result
             
         except Exception as e:
             logger.error(f"5M analysis error: {e}")
-            return False
+            return False, {}
 
     async def _validate_symbol(self, symbol):
         """Parallel technical validation for a single symbol"""
@@ -4094,24 +4224,38 @@ class KrakenAdvancedGridStrategy:
             return True  # Still return True on error to allow order
 
     async def validate_grid_order_size(self, symbol: str, size: float) -> float:
-        """Validate if grid order size meets exchange minimums"""
+        """Validate grid order size with exchange limits and available balance"""
         try:
-            # Get market info from exchange
             market = self.exchange.market(symbol)
-            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
+            min_size = market['limits']['amount']['min']
+            precision = market['precision']['amount']
             
-            if size < min_amount:
-                logger.warning(f"Grid order size {size} is below minimum {min_amount} for {symbol}")
-                # Calculate the adjusted size to meet minimum
-                adjusted_size = min_amount * 1.01  # Add 1% buffer
-                logger.info(f"Adjusting grid order size to {adjusted_size}")
-                return adjusted_size
+            # Handle futures contracts
+            if market['futures']:
+                return round(max(size, min_size), precision)
                 
-            return size
+            # Spot market validation
+            base_currency = symbol.split('/')[0]
+            balance = await self.exchange.fetch_balance()
+            available = balance.get(base_currency, {}).get('free', 0)
+            
+            # Check against minimum size
+            if size < min_size:
+                logger.warning(f"Grid size {size} < min {min_size} for {symbol}")
+                adjusted = round(min_size * 1.01, precision)
+                logger.info(f"Adjusted to {adjusted}")
+                return adjusted
+                
+            # Check available balance
+            if available < size:
+                logger.warning(f"Insufficient {base_currency} balance: {available} < {size}")
+                return 0.0
+            
+            return round(size, precision)
             
         except Exception as e:
-            logger.error(f"Error validating grid order size: {e}")
-            return size  # Return original size if validation fails
+            logger.error(f"Size validation error: {e}")
+            return 0.0
 
     async def verify_actual_positions(self) -> Dict[str, Dict]:
         """Verify actual positions vs open orders with precise FIFO tracking"""
@@ -4454,6 +4598,18 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.error(f"Error calculating volatility: {e}")
             return 2.0  # Return a default moderate volatility
+
+    def calculate_atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
+        try:
+            atr = talib.ATR(high, low, close, period)
+            if pd.isna(atr.iloc[-1]) or atr.iloc[-1] <= 0:
+                # Fallback to recent price range
+                recent_range = high.rolling(period).max() - low.rolling(period).min()
+                return recent_range.iloc[-1] / close.iloc[-1]
+            return atr.iloc[-1]
+        except Exception as e:
+            logger.warning(f"ATR calculation failed: {e}")
+            return 0.01  # 1% default
 
 if __name__ == "__main__":
     try:
