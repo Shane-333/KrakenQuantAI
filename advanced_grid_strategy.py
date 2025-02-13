@@ -1012,7 +1012,7 @@ class KrakenAdvancedGridStrategy:
             return False
         
     async def execute_grid_orders(self, symbol: str, force_create: bool = False) -> None:
-        """Execute grid orders with fee validation"""
+        """Execute grid orders with fee validation, ensuring orders are only placed near S/R levels"""
         try:
             logger.info(f"\n{'='*50}")
             logger.info(f"🔄 STARTING GRID EXECUTION FOR {symbol}")
@@ -1023,7 +1023,7 @@ class KrakenAdvancedGridStrategy:
                 logger.warning(f"❌ No historical data for {symbol}")
                 return
 
-            # Calculate volatility with default fallback
+            # Calculate volatility with fallback default
             try:
                 volatility = await self.calculate_volatility(df)
                 if volatility is None:
@@ -1035,10 +1035,10 @@ class KrakenAdvancedGridStrategy:
 
             current_price = float(df['close'].iloc[-1])
             
-            # Make sure adjust_grid_parameters is async
+            # Adjust grid parameters as needed
             await self.adjust_grid_parameters(volatility, current_price)
 
-            # First verify if this is a spot position
+            # Check if we are in a spot position by fetching balance
             try:
                 balance = await self.exchange.fetch_balance()
                 asset = symbol.split('/')[0]
@@ -1049,17 +1049,15 @@ class KrakenAdvancedGridStrategy:
                 logger.error(f"Error checking spot balance: {e}")
                 is_spot = False
 
-            # If position exists, use manage_stop_loss instead of direct execution
+            # If we already have an active position, manage stop loss instead of creating new orders
             if symbol in self.active_positions:
                 position = self.active_positions[symbol]
                 current_price = await self.get_current_price(symbol)
                 await self.manage_stop_loss(symbol, position, current_price)
                 return
 
-            # Get multi-timeframe trend analysis
+            # Multi-timeframe trend analysis
             trend_data = await self.analyze_multi_timeframe_trend(symbol)
-            
-            # Log trend analysis
             logger.info(f"\nMulti-Timeframe Analysis for {symbol}:")
             for timeframe, data in trend_data.items():
                 logger.info(f"{timeframe}: {data['trend'].upper()} (Strength: {data['strength']:.2f}%)")
@@ -1067,28 +1065,22 @@ class KrakenAdvancedGridStrategy:
                 logger.info(f"Near Support: {'✅' if data['near_support'] else '❌'}")
                 logger.info(f"Near Resistance: {'✅' if data['near_resistance'] else '❌'}")
 
-            # Adjust grid levels based on technical analysis
+            # Adjust grid levels based on technical conditions (for spot, adjust buy order grids)
             if is_spot:
-                # Add more buy grids if oversold in higher timeframes
                 if trend_data['1h']['is_oversold'] and trend_data['1h']['near_support'] and trend_data['1h']['rsi'] > 45:
                     self.grid_levels += 1
                     logger.info("✅ Adding extra buy grid - Oversold conditions")
-                
-                # Reduce grids if overbought
                 if trend_data['1h']['is_overbought'] and trend_data['1h']['near_resistance']:
                     self.grid_levels = max(1, self.grid_levels - 1)
                     logger.info("⚠️ Reducing grid levels - Overbought conditions")
 
-            # Market Analysis - Do this BEFORE checking existing orders
+            # Market analysis before order creation
             logger.info(f"\n{'='*30}")
             logger.info(f"🔍 ANALYZING MARKET CONDITIONS FOR {symbol}")
             logger.info(f"{'='*30}")
  
             should_trade, volatility = await self.analyze_market_conditions(df, symbol)
             logger.info(f"Market conditions check - Should trade: {'✅' if should_trade else '❌'}, Volatility: {volatility:.2f}%")
-            if not should_trade:
-                return
-            
             if not should_trade:
                 logger.info(f"❌ Market conditions not favorable for {symbol}, skipping")
                 return
@@ -1098,12 +1090,11 @@ class KrakenAdvancedGridStrategy:
                 logger.info("❌ 5min conditions not met")
                 return
                 
-            # Adjust grid parameters based on volatility
+            # Adjust grid parameters again based on latest data
             await self.adjust_grid_parameters(volatility, float(df['close'].iloc[-1]))
             logger.info(f"Grid parameters adjusted for volatility: {volatility:.2f}%")
 
             logger.info(f"🔍 Checking existing orders for {symbol}")
-            # Now check existing orders
             if not force_create:
                 has_existing_orders = await self.check_existing_orders(symbol)
                 logger.info(f"Existing orders check: {'✅' if has_existing_orders else '❌'}")
@@ -1111,14 +1102,13 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Valid existing orders for {symbol}, skipping")
                     return
 
-            # Get current price and validate
             current_price = await self.get_current_price(symbol)
             if not current_price:
                 logger.warning(f"❌ Could not get current price for {symbol}")
                 return
             logger.info(f"Current price for {symbol}: ${current_price:.4f}")
 
-            # Calculate S/R levels
+            # Calculate Support/Resistance levels
             logger.info(f"📊 Calculating support/resistance levels")
             support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
 
@@ -1131,7 +1121,7 @@ class KrakenAdvancedGridStrategy:
 
             logger.info(f"✅ Generated {len(grid_prices)} grid prices")
             
-            # Convert numpy float64 to regular float and ensure proper format
+            # Normalize grid prices and their confidence levels
             normalized_prices = []
             for price in grid_prices:
                 if isinstance(price, (tuple, list)):
@@ -1143,12 +1133,9 @@ class KrakenAdvancedGridStrategy:
                     logger.warning(f"Skipping invalid price format: {price}")
                     continue
 
-            # Determine the maximum confidence value
             max_confidence = max((conf for _, conf in normalized_prices), default=0)
-
-            # Initialize valid grids list and confidence map
             valid_grids = []
-            grid_confidence = {}  # Store confidence values separately
+            grid_confidence = {}
             previous_price = None
 
             # Calculate price change and volume confirmation
@@ -1157,9 +1144,9 @@ class KrakenAdvancedGridStrategy:
             current_volume = df['volume'].iloc[-1]
             volume_confirmed = current_volume > recent_volume * 0.1  # Reduced to 10%
 
-            # Evaluate candidate grid prices
+            # Evaluate candidate grid prices for S/R alignment and technical signals
             for price_item in grid_prices:
-                # Convert price to float and assign default confidence if needed
+                # Normalize price and determine confidence
                 if isinstance(price_item, (np.float64, float)):
                     price_obj = float(price_item)
                     raw_confidence = 1.0
@@ -1167,32 +1154,42 @@ class KrakenAdvancedGridStrategy:
                     price_obj, raw_confidence = price_item
                     price_obj = float(price_obj)
                 
-                # Normalize confidence
                 if max_confidence > 0:
                     normalized_confidence = (raw_confidence / max_confidence) * 100  # Scale to 0-100
-                    if normalized_confidence < 70:  # Require at least 70% of max confidence
+                    if normalized_confidence < 70:  # Filter out low-confidence levels
                         logger.info(f"Skipping price {price_obj} - confidence too low: {normalized_confidence:.2f}")
                         continue
                 else:
                     normalized_confidence = 0
                 
-                # Define minimum distance between grids
+                # Ensure grid prices are not too close to each other
                 min_distance = current_price * 0.02
                 if previous_price and abs(price_obj - previous_price) < min_distance:
                     logger.info(f"Skipping price {price_obj} - too close to previous grid at {previous_price}")
                     continue
                 
-                # Check S/R alignment
+                # S/R alignment checks
                 is_near_support = any(abs(price_obj - s) / s <= 0.01 for s in support_levels)
                 is_near_resistance = any(abs(price_obj - r) / r <= 0.01 for r in resistance_levels)
-                
-                # Determine intended trade side
                 would_be_side = "buy" if price_obj < current_price else "sell"
-                momentum_aligned = (price_change > 0 and price_obj > current_price) or \
-                                 (price_change < 0 and price_obj < current_price)
+                momentum_aligned = ((price_change > 0 and price_obj > current_price) or
+                                    (price_change < 0 and price_obj < current_price))
+                
+                # For spot mode, omit sell side grid generation entirely
+                if is_spot and would_be_side == "sell":
+                    logger.info(f"❌ Skipping sell grid creation for spot positions at {price_obj}")
+                    continue
 
-                # Compute technical indicators
-                rsi = talib.RSI(df['close'], 14).iloc[-1]  
+                # For buys, require alignment with support (and not too close to resistance)
+                # For sells, require alignment with resistance (and not too near support)
+                if would_be_side == "buy":
+                    valid_sr = is_near_support and (not is_near_resistance)
+                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] < 35
+                else:
+                    valid_sr = is_near_resistance and (not is_near_support)
+                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] > 65
+
+                # Check additional technical indicators
                 macd_line, signal_line, histogram = talib.MACD(
                     df['close'], 
                     fastperiod=self.macd_fast,
@@ -1205,15 +1202,6 @@ class KrakenAdvancedGridStrategy:
                     (macd_line.iloc[-1] > 0)
                 )
                 
-                # Update S/R condition: enforce for buys that the price is near support AND NOT near resistance,
-                # and for sells the opposite.
-                if would_be_side == "buy":
-                    valid_sr = is_near_support and (not is_near_resistance)
-                    valid_rsi = rsi < 35
-                else:
-                    valid_sr = is_near_resistance and (not is_near_support)
-                    valid_rsi = rsi > 65
-
                 valid_for_trade = (
                     (momentum_aligned or volume_confirmed) and
                     valid_sr and
@@ -1247,34 +1235,22 @@ class KrakenAdvancedGridStrategy:
             for price in valid_grids:
                 side = "buy" if price < current_price else "sell"
                 
-                # Handle spot position logic
-                if is_spot:
-                    if side == "sell":
-                        # Only allow sells if we have a position
-                        if symbol in self.positions and self.positions[symbol]['size'] > 0:
-                            # Verify actual spot balance
-                            asset = symbol.split('/')[0]
-                            spot_balance = (await self.exchange.fetch_balance()).get(asset, {}).get('free', 0)
-                            if spot_balance < size:
-                                logger.info(f"❌ Insufficient {asset} balance for sell order: {spot_balance} < {size}")
-                                continue
-                        else:
-                            logger.info(f"❌ Skipping sell order at ${price:.4f} - No spot position")
-                            continue
-                    else:  # For buys in spot - check USD balance
-                        pass
-                
+                # For spot positions, omit sell orders; the monitor_stop_loss method handles sells.
+                if is_spot and side == "sell":
+                    logger.info(f"❌ Skipping sell order for spot position at ${price:.4f} (handled by stop loss monitoring)")
+                    continue
+
                 # Get relevant S/R levels based on order side
                 if side == "buy":
                     relevant_levels = support_levels
                     level_type = "support"
-                    max_distance = 0.01  # 1% from support
+                    max_distance = 0.01  # 1% tolerance
                 else:
                     relevant_levels = resistance_levels 
                     level_type = "resistance"
-                    max_distance = 0.008  # 0.8% from resistance
+                    max_distance = 0.008  # 0.8% tolerance
 
-                # Check proximity to relevant S/R
+                # Check that the grid price is within the acceptable buffer of a key level
                 near_level = any(abs(price - level) / level < max_distance for level in relevant_levels[:3])
                 if not near_level:
                     logger.info(f"Skipping {side} order at {price} - not near {level_type}")
@@ -1282,18 +1258,16 @@ class KrakenAdvancedGridStrategy:
                 
                 logger.info(f"\nValidating {side.upper()} order at ${price:.4f}")
                 if abs(price - current_price) < min_buffer:
-                    logger.info(f"❌ Skipping - too close to current price (buffer: ${min_buffer:.4f})")
+                    logger.info(f"❌ Skipping order - price too close to current price (buffer: ${min_buffer:.4f})")
                     continue
                     
-                # Get initial size
+                # Determine order size
                 size = await self.calculate_position_size(price, symbol)
                 logger.info(f"Initial calculated position size: {size}")
-                
-                # Add size validation before fee check
                 size = await self.validate_grid_order_size(symbol, size)
                 logger.info(f"Validated position size: {size}")
 
-                # Add USD balance check for spot buys
+                # For spot buys, check USD balance
                 if is_spot and side == "buy":
                     try:
                         usd_balance = (await self.exchange.fetch_balance())['USD']['free']
@@ -1305,7 +1279,7 @@ class KrakenAdvancedGridStrategy:
                         logger.error(f"Balance check error: {e}")
                         continue
                 
-                # Add fee validation
+                # Validate profitability
                 if not self.validate_trade_profitability(price, size, symbol):
                     logger.info(f"❌ Skipping - not profitable after fees")
                     continue
@@ -1315,7 +1289,7 @@ class KrakenAdvancedGridStrategy:
                         'trading_agreement': 'agree',
                         'oflags': 'post'
                     }
-                    logger.info(f"Attempting to place order with params:")
+                    logger.info("Attempting to place order with params:")
                     logger.info(f"Symbol: {symbol}")
                     logger.info(f"Type: limit")
                     logger.info(f"Side: {side}")
