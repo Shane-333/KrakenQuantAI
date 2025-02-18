@@ -522,7 +522,7 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error in market analysis: {e}")
             return False, 0.0
 
-    async def adjust_grid_parameters(self, volatility: float, current_price: float) -> None:
+    async def adjust_grid_parameters(self, volatility: float, current_price: float, symbol: str) -> None:
         """Adjust grid parameters based on volatility"""
         try:
             logger.info(f"\n{'='*30}")
@@ -552,8 +552,8 @@ class KrakenAdvancedGridStrategy:
                 self.grid_spacing = 0.02  # 2%
                 logger.info("High volatility setup - Wider grids")
 
-            # Adjust for minimum profitability
-            min_profit_needed = self.calculate_total_fees(current_price, self.min_position_size, "BTC/USD") * 2
+            # Adjust for minimum profitability - Use actual symbol here
+            min_profit_needed = await self.calculate_total_fees(current_price, self.min_position_size, symbol) * 2
             min_grid_spacing = min_profit_needed / current_price
             
             if self.grid_spacing < min_grid_spacing:
@@ -917,28 +917,22 @@ class KrakenAdvancedGridStrategy:
             return 0.0001, 0.0001  # Default fallback rates
 
     async def get_exchange_fees(self, symbol: str) -> Tuple[float, float]:
-        """Get current maker/taker fees from Kraken Spot"""
+        """Get current maker/taker fees for Kraken spot"""
         try:
-            # Use CCXT's built-in fee fetching for spot
-            fees = await self.exchange.fetch_trading_fees()
+            # Use Kraken's standard spot fee tiers
+            # https://www.kraken.com/features/fee-schedule
+            maker_fee = 0.0016  # 0.16% maker fee
+            taker_fee = 0.0026  # 0.26% taker fee
             
-            if fees and 'maker' in fees and 'taker' in fees:
-                maker_fee = fees['maker']
-                taker_fee = fees['taker']
-                
-                logger.info(f"\nSpot Trading Fees:")
-                logger.info(f"Maker Fee: {maker_fee:.4%}")
-                logger.info(f"Taker Fee: {taker_fee:.4%}")
-                
-                return maker_fee, taker_fee
-                
-            logger.warning("Could not fetch spot trading fees")
+            logger.info(f"\nSpot Trading Fees:")
+            logger.info(f"Maker Fee: {maker_fee:.4%}")
+            logger.info(f"Taker Fee: {taker_fee:.4%}")
+            
+            return maker_fee, taker_fee
             
         except Exception as e:
-            logger.error(f"Error fetching Kraken Spot fees: {e}")
-        
-        # Default conservative spot fees
-        return 0.0026, 0.0040  # 0.26% default Kraken spot fees
+            logger.error(f"Error getting fees: {e}")
+            return 0.0026, 0.0026  # Conservative default
 
     async def calculate_total_fees(self, price: float, size: float, symbol: str) -> float:
         """Calculate total round-trip fees including entry, exit, and funding"""
@@ -969,38 +963,52 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error calculating fees: {e}")
             return 0.0
 
-    def validate_trade_profitability(self, price: float, size: float, symbol: str) -> bool:
+    async def validate_trade_profitability(self, price: float, size: float, symbol: str) -> bool:
         """Validate if trade is profitable after fees with dynamic thresholds"""
         try:
-            # Calculate total fees
-            total_fees = self.calculate_total_fees(price, size, symbol)
+            # First validate minimum size
+            if size < 0.00001:  # Kraken's minimum precision
+                logger.warning(f"Size {size} is below minimum precision of 0.00001")
+                return False
             
-            # Get price-appropriate minimum profit threshold
-            if price >= 20000:
-                min_profit_multiplier = 2.0  # Higher threshold for BTC
-            elif price >= 1000:
-                min_profit_multiplier = 1.8  # ETH range
-            elif price >= 100:
-                min_profit_multiplier = 1.6  # High-value alts
-            elif price >= 10:
-                min_profit_multiplier = 1.4  # Mid-value alts
-            elif price >= 1:
-                min_profit_multiplier = 1.2  # Low-value alts
-            else:
-                min_profit_multiplier = 1.1  # Micro-price alts
-                
-            # Calculate minimum profit needed with dynamic threshold
-            min_profit_needed = total_fees * min_profit_multiplier
+            # Calculate total fees using the dedicated fee calculation method
+            total_fees = await self.calculate_total_fees(price, size, symbol)  # Added await here
+            
+            # Determine price-based profit multiplier
+            price_ranges = [
+                (20000, 2.0),   # BTC range
+                (1000, 1.8),    # ETH range
+                (100, 1.6),     # High-value alts
+                (10, 1.4),      # Mid-value alts
+                (1, 1.2),       # Low-value alts
+                (0, 1.1)        # Micro-price alts
+            ]
+            
+            min_profit_multiplier = next(
+                (multiplier for threshold, multiplier in price_ranges if price >= threshold),
+                1.1
+            )
             
             # Calculate grid profit
-            grid_profit = price * size * self.grid_spacing
+            grid_profit = abs(price * size * self.grid_spacing)
             
-            # Check if grid profit covers fees with appropriate buffer
+            # Calculate minimum required profit
+            min_profit_relative = total_fees * min_profit_multiplier
+            min_profit_absolute = max(
+                price * size * 0.001,  # 0.1% of position value
+                0.25                   # Minimum $0.25
+            )
+            min_profit_needed = max(min_profit_relative, min_profit_absolute)
+            
+            # Validate profitability
             is_profitable = grid_profit > min_profit_needed
             
-            logger.info(f"\nProfitability Check for {symbol}:")
-            logger.info(f"Price Range: ${price:.4f}")
+            # Log detailed profitability analysis
+            logger.info(f"\nProfitability Analysis for {symbol}:")
+            logger.info(f"Price: ${price:.4f}")
+            logger.info(f"Size: {size:.6f}")  # Increased precision in logging
             logger.info(f"Grid Profit: ${grid_profit:.4f}")
+            logger.info(f"Total Fees: ${total_fees:.4f}")
             logger.info(f"Min Profit Needed: ${min_profit_needed:.4f}")
             logger.info(f"Profit Multiplier: {min_profit_multiplier}x")
             logger.info(f"Profitable: {'✅' if is_profitable else '❌'}")
@@ -1036,7 +1044,7 @@ class KrakenAdvancedGridStrategy:
             current_price = float(df['close'].iloc[-1])
             
             # Adjust grid parameters as needed
-            await self.adjust_grid_parameters(volatility, current_price)
+            await self.adjust_grid_parameters(volatility, current_price, symbol)
 
             # Check if we are in a spot position by fetching balance
             try:
@@ -1091,7 +1099,7 @@ class KrakenAdvancedGridStrategy:
                 return
                 
             # Adjust grid parameters again based on latest data
-            await self.adjust_grid_parameters(volatility, float(df['close'].iloc[-1]))
+            await self.adjust_grid_parameters(volatility, float(df['close'].iloc[-1]), symbol)
             logger.info(f"Grid parameters adjusted for volatility: {volatility:.2f}%")
 
             logger.info(f"🔍 Checking existing orders for {symbol}")
@@ -1184,10 +1192,10 @@ class KrakenAdvancedGridStrategy:
                 # For sells, require alignment with resistance (and not too near support)
                 if would_be_side == "buy":
                     valid_sr = is_near_support and (not is_near_resistance)
-                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] < 35
+                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] < 40
                 else:
                     valid_sr = is_near_resistance and (not is_near_support)
-                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] > 65
+                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] > 60
 
                 # Check additional technical indicators
                 macd_line, signal_line, histogram = talib.MACD(
@@ -1197,17 +1205,15 @@ class KrakenAdvancedGridStrategy:
                     signalperiod=self.macd_signal
                 )
                 macd_bullish = (
-                    (macd_line.iloc[-1] > signal_line.iloc[-1]) and
-                    (histogram.iloc[-1] > histogram.iloc[-2]) and
-                    (macd_line.iloc[-1] > 0)
+                    (macd_line.iloc[-1] > signal_line.iloc[-1]) or  # Changed to OR
+                    (histogram.iloc[-1] > histogram.iloc[-2])
                 )
                 
                 valid_for_trade = (
                     (momentum_aligned or volume_confirmed) and
                     valid_sr and
-                    valid_rsi and 
-                    macd_bullish and  
-                    normalized_confidence > 8
+                    (valid_rsi or macd_bullish) and  # OR instead of AND
+                    normalized_confidence > 70  
                 )
                 
                 if valid_for_trade:
@@ -1230,7 +1236,6 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"{'='*30}")
 
             orders_placed = 0
-            min_buffer = current_price * 0.005
 
             for price in valid_grids:
                 side = "buy" if price < current_price else "sell"
@@ -1257,10 +1262,7 @@ class KrakenAdvancedGridStrategy:
                     continue
                 
                 logger.info(f"\nValidating {side.upper()} order at ${price:.4f}")
-                if abs(price - current_price) < min_buffer:
-                    logger.info(f"❌ Skipping order - price too close to current price (buffer: ${min_buffer:.4f})")
-                    continue
-                    
+
                 # Determine order size
                 size = await self.calculate_position_size(price, symbol)
                 logger.info(f"Initial calculated position size: {size}")
@@ -1280,7 +1282,7 @@ class KrakenAdvancedGridStrategy:
                         continue
                 
                 # Validate profitability
-                if not self.validate_trade_profitability(price, size, symbol):
+                if not await self.validate_trade_profitability(price, size, symbol):
                     logger.info(f"❌ Skipping - not profitable after fees")
                     continue
                 
@@ -1297,6 +1299,16 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Price: {price}")
                     logger.info(f"Params: {order_params}")
                     
+                    # Validate size first
+                    if size < 0.00001:  # Kraken's minimum precision
+                        logger.warning(f"❌ Size {size} is below minimum precision of 0.00001")
+                        continue
+
+                    # Validate profitability - Add await here
+                    if not await self.validate_trade_profitability(price, size, symbol):
+                        logger.info(f"❌ Skipping - not profitable after fees")
+                        continue
+
                     order = await self.exchange.create_order(
                         symbol=symbol,
                         type='limit',
@@ -2518,8 +2530,8 @@ class KrakenAdvancedGridStrategy:
                 logger.error(f"Invalid position size for {symbol}")
                 return []
 
-            total_fees = self.calculate_total_fees(current_price, avg_position_size, symbol)
-            min_profit_needed = total_fees * 2
+            total_fees = await self.calculate_total_fees(current_price, avg_position_size, symbol)  # Added await here
+            min_profit_needed = max(total_fees * 1.5, 0.02)  # Combine both requirements
 
             logger.info(f"\nGrid Profitability Analysis for {symbol}:")
             logger.info(f"Min Profit Needed: ${min_profit_needed:.4f}")
@@ -2876,25 +2888,26 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.error(f"Error reassessing grids for {symbol}: {e}")
 
-    def calculate_total_fees(self, price: float, size: float, is_maker: bool = True) -> float:
-        """Calculate total fees including slippage and volatility buffer"""
+    async def calculate_total_fees(self, price: float, size: float, symbol: str) -> float:
+        """Calculate total round-trip fees including entry and exit"""
         try:
-            # Base fee calculation
-            fee_rate = self.maker_fee if is_maker else self.taker_fee
-            base_fee = price * size * fee_rate
+            # Get current exchange fees - ENSURE THIS IS AWAITED
+            maker_fee, taker_fee = await self.get_exchange_fees(symbol)
             
-            # Add slippage and volatility buffers
-            total_buffer = self.slippage_buffer + self.volatility_buffer
-            buffer_cost = price * size * total_buffer
+            # Calculate fees for spot trading
+            entry_fee = price * size * maker_fee
+            exit_fee = price * size * taker_fee
             
-            total_cost = base_fee + buffer_cost
+            total_fees = entry_fee + exit_fee
             
-            logger.info(f"Fee Calculation:")
-            logger.info(f"Base Fee: ${base_fee:.4f} ({fee_rate*100}%)")
-            logger.info(f"Buffer Cost: ${buffer_cost:.4f} ({total_buffer*100}%)")
-            logger.info(f"Total Cost: ${total_cost:.4f}")
+            # Log fee breakdown with actual rates
+            logger.info(f"\nFee Breakdown for {symbol}:")
+            logger.info(f"Entry Fee: ${entry_fee:.4f} (Maker Rate: {maker_fee:.4%})")
+            logger.info(f"Exit Fee: ${exit_fee:.4f} (Taker Rate: {taker_fee:.4%})")
+            logger.info(f"Total Fees: ${total_fees:.4f}")
             
-            return total_cost
+            return total_fees
+                
         except Exception as e:
             logger.error(f"Error calculating fees: {e}")
             return 0.0
@@ -4108,29 +4121,33 @@ class KrakenAdvancedGridStrategy:
     async def get_available_balance(self) -> float:
         """Get actual available balance accounting for open orders"""
         try:
-            balance = await self.get_account_balance()
+            balance = await self.exchange.fetch_balance()
             
-            # Get all open orders to calculate committed funds
+            # Get USD balance directly from response
+            usd_balance = float(balance.get('USD', {}).get('free', 0.0))
+            
+            # Get committed funds from open orders
             open_orders = await self.exchange.fetch_open_orders()
             committed_funds = sum(
                 float(order['price']) * float(order['amount'])
                 for order in open_orders
-                if order['side'] == 'buy'  # Only count buy orders
+                if order['side'] == 'buy'
             )
-            
-            actual_available = balance - committed_funds
+        
+            actual_available = usd_balance - committed_funds
             logger.info(f"\nBalance Analysis:")
-            logger.info(f"Total Balance: ${balance:.2f}")
+            logger.info(f"USD Balance: ${usd_balance:.2f}")
             logger.info(f"Committed in Orders: ${committed_funds:.2f}")
             logger.info(f"Actually Available: ${actual_available:.2f}")
-            
+    
             # Update sufficient funds flag
-            self.has_sufficient_funds = actual_available > 20  # Minimum $20 available
-            
+            self.has_sufficient_funds = actual_available > 15  # Minimum $15 available
+    
             return actual_available
-            
+        
         except Exception as e:
             logger.error(f"Error calculating available balance: {e}")
+            logger.error(f"Error details: {str(e)}")
             return 0.0
 
     async def execute_stop_loss(self, symbol: str, position_size: float, is_spot: bool, reason: str = "stop loss") -> bool:
@@ -4194,45 +4211,28 @@ class KrakenAdvancedGridStrategy:
         logger.error(f"❌ Failed to execute {reason} after {max_retries} attempts")
         return False
 
-    async def validate_order_size(self, symbol: str, amount: float) -> bool:
-        """Always validate order size as true to allow any size orders"""
-        try:
-            logger.info(f"Allowing order for {symbol} with size {amount}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error in order size validation: {e}")
-            return True  # Still return True on error to allow order
-
     async def validate_grid_order_size(self, symbol: str, size: float) -> float:
-        """Validate grid order size with exchange limits and available balance"""
+        """Validate and adjust order size for spot trading"""
         try:
+            # Get market info
             market = self.exchange.market(symbol)
-            min_size = market['limits']['amount']['min']
-            precision = market['precision']['amount']
-            
-            # Handle futures contracts
-            if market['futures']:
-                return round(max(size, min_size), precision)
-                
-            # Spot market validation
+            min_size = float(market['limits']['amount']['min'])
             base_currency = symbol.split('/')[0]
-            balance = await self.exchange.fetch_balance()
-            available = balance.get(base_currency, {}).get('free', 0)
+            available = await self.get_available_balance()
             
-            # Check against minimum size
-            if size < min_size:
-                logger.warning(f"Grid size {size} < min {min_size} for {symbol}")
-                adjusted = round(min_size * 1.01, precision)
-                logger.info(f"Adjusted to {adjusted}")
-                return adjusted
-                
-            # Check available balance
+            # Check available balance first
             if available < size:
                 logger.warning(f"Insufficient {base_currency} balance: {available} < {size}")
                 return 0.0
+                
+            # Increase size if below minimum
+            if size < min_size:
+                logger.warning(f"⚠️ Increasing size to meet {symbol} minimum {min_size}")
+                size = min_size * 1.01  # Add 1% buffer
             
-            return round(size, precision)
+            # Round to appropriate precision
+            precision = int(market['precision']['amount'])
+            return round(float(size), precision)
             
         except Exception as e:
             logger.error(f"Size validation error: {e}")
@@ -4449,27 +4449,26 @@ class KrakenAdvancedGridStrategy:
     async def _price_position_checks(self, current_price: float, 
                                     support_levels: List[float], 
                                     resistance_levels: List[float]) -> bool:
-        """Validate price position relative to support/resistance levels"""
+        """Validate price position relative to support levels for spot buying"""
         try:
-            # Resistance check with buffer
-            above_resistance = False
-            if resistance_levels:
-                nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
-                resistance_buffer = nearest_resistance * 0.02  # 2% buffer
-                above_resistance = current_price > (nearest_resistance + resistance_buffer)
-                logger.info(f"Resistance Check: {current_price:.4f} vs {nearest_resistance:.4f} (+2% buffer)")
-
-            # Support zone check
+            # Support zone check only for spot buying
             near_support = False
             if support_levels:
-                # Check against first 3 support levels with 1.5% tolerance
+                # Check against first 3 support levels with 2% tolerance
                 relevant_supports = sorted(support_levels)[:3]
-                near_support = any(abs(current_price - s)/s < 0.015 for s in relevant_supports)
+                near_support = any(abs(current_price - s)/current_price < 0.02 for s in relevant_supports)
                 logger.info(f"Support Check: Near {'✅' if near_support else '❌'}")
+                logger.info(f"Relevant Supports: {[round(s, 4) for s in relevant_supports]}")
+                logger.info(f"Current Price: {current_price:.4f}")
 
-            logger.info(f"Price Position: {'✅ Above Resistance' if above_resistance else '⚠️ Neutral' if near_support else '❌ Below Support'}")
+            # Keep resistance check for logging purposes only
+            if resistance_levels:
+                nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
+                logger.info(f"Nearest Resistance: {nearest_resistance:.4f} (+2% buffer)")
+
+            logger.info(f"Price Position: {'✅ Near Support' if near_support else '❌ Not Near Support'}")
             
-            return above_resistance or near_support
+            return near_support  # Only return support check for spot buying
             
         except Exception as e:
             logger.error(f"Price position check error: {e}")
@@ -4484,7 +4483,7 @@ class KrakenAdvancedGridStrategy:
             bounce_signal = (direction_changes[-1] > 0) and (df['volume'].iloc[-1] > df['volume'].iloc[-2]*1.5)
             
             # Add RSI confirmation
-            rsi = ta.RSI(df['close'], 14).iloc[-1]
+            rsi = talib.RSI(df['close'], 14).iloc[-1]
             return bounce_signal and (rsi < 35)
         except Exception as e:
             logger.error(f"Bounce detection error: {e}")
@@ -4591,6 +4590,20 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.warning(f"ATR calculation failed: {e}")
             return 0.01  # 1% default
+
+    def is_near_support(self, price: float, support_levels: List[float]) -> bool:
+        """Check if price is within 2% of a support level"""
+        if not support_levels:
+            return False
+        
+        nearest_support = min(support_levels, key=lambda x: abs(x - price))
+        price_diff_pct = abs(price - nearest_support) / price  # Changed denominator
+        
+        # Allow 2% threshold for buy levels
+        is_near = price_diff_pct <= 0.02  # 2% threshold
+        
+        logger.info(f"Support check: {price} vs {nearest_support} ({price_diff_pct*100:.2f}%)")
+        return is_near
 
 if __name__ == "__main__":
     try:
