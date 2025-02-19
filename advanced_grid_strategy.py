@@ -3323,68 +3323,131 @@ class KrakenAdvancedGridStrategy:
             return False, 0.0
 
     async def filter_symbols(self, symbols: List[str]) -> List[str]:
-        """Market-analyzer enhanced symbol filtering"""
+        """Market-analyzer enhanced symbol filtering with strict daily requirements"""
         try:
             # Stage 0: Remove blacklisted symbols
             filtered = [s for s in symbols if s not in self.STABLE_BLACKLIST]
             
-            # Stage 1: Liquidity filter (lines 3361-3371)
+            # Stage 1: Liquidity filter
             liquidity_filtered = await self._quick_liquidity_filter(filtered)
             
-            # Stage 2: Parallel market analysis (new)
+            # Stage 2: Parallel market analysis with daily requirements
             analysis_tasks = [
                 self._analyze_symbol(sym)
                 for sym in liquidity_filtered[:20]  # Analyze top 20
             ]
             results = await asyncio.gather(*analysis_tasks)
             
-            # Stage 3: Scoring and sorting with dynamic threshold
-            sorted_symbols = sorted(
-                [(sym, score) for sym, score in results if score is not None],
-                key=lambda x: x[1],
-                reverse=True
-            )
+            # Stage 3: Only keep symbols that passed daily analysis (confidence > 0)
+            valid_symbols = [(sym, score) for sym, score in results if score > 7.0]  # Requiring 70% confidence
             
-            # Get top 10% or minimum 3 symbols
-            top_count = max(3, int(len(sorted_symbols) * 0.1))
-            return [sym for sym, _ in sorted_symbols[:top_count]]
-        
+            if not valid_symbols:
+                logger.info("❌ No symbols passed strict daily analysis criteria")
+                return []
+            
+            # Sort by confidence score
+            sorted_symbols = sorted(valid_symbols, key=lambda x: x[1], reverse=True)
+            
+            # Get top 3 symbols with highest confidence
+            selected = [sym for sym, _ in sorted_symbols[:3]]
+            
+            logger.info("\n🎯 Selected Symbols:")
+            for sym, score in sorted_symbols[:3]:
+                logger.info(f"{sym}: Confidence {score:.2f}/10")
+            
+            return selected
+            
         except Exception as e:
             logger.error(f"Filter error: {e}")
             return []
 
     async def _analyze_symbol(self, symbol: str) -> Tuple[str, float]:
-        """Market analyzer-powered symbol validation"""
+        """Market analyzer-powered symbol validation with strict daily requirements"""
         try:
-            # Get multi-timeframe data (lines 3390-3393)
-            df = await self.get_historical_data(symbol, '4h', limit=100)
-            if df is None or len(df) < 50:
+            # Get daily timeframe data
+            daily_df = await self.get_historical_data(symbol, '1d', limit=200)  # Increased limit for better analysis
+            if daily_df is None or len(daily_df) < 200:  # Need enough data for 200 EMA
                 return symbol, 0.0
 
-            # Get analyzer scores (lines 460-472, 513-515)
-            price_data = {
-                'timeframe': '4h',
-                'price_data': {
-                    'open': df['open'].tolist(),
-                    'high': df['high'].tolist(),
-                    'low': df['low'].tolist(),
-                    'close': df['close'].tolist()
-                }
+            # 1. EMA Structure Check
+            daily_df['ema9'] = talib.EMA(daily_df['close'], 9)
+            daily_df['ema21'] = talib.EMA(daily_df['close'], 21)
+            daily_df['ema200'] = talib.EMA(daily_df['close'], 200)
+            
+            current_close = daily_df['close'].iloc[-1]
+            ema9 = daily_df['ema9'].iloc[-1]
+            ema21 = daily_df['ema21'].iloc[-1]
+            ema200 = daily_df['ema200'].iloc[-1]
+            
+            # Check EMA alignment and crossover
+            ema_cross = ema9 > ema21 and daily_df['ema9'].iloc[-2] <= daily_df['ema21'].iloc[-2]
+            above_ema200 = current_close > ema200
+            
+            if not (ema_cross and above_ema200):
+                logger.info(f"{symbol} ❌ Failed EMA requirements")
+                return symbol, 0.0
+
+            # 2. RSI Check
+            rsi = talib.RSI(daily_df['close'], 14).iloc[-1]
+            if rsi <= 50:
+                logger.info(f"{symbol} ❌ RSI below 50: {rsi:.2f}")
+                return symbol, 0.0
+
+            # 3. ATR Volatility Check
+            atr = talib.ATR(daily_df['high'], daily_df['low'], daily_df['close'], 14).iloc[-1]
+            atr_pct = (atr / current_close) * 100
+            if atr_pct <= 1.5:
+                logger.info(f"{symbol} ❌ ATR too low: {atr_pct:.2f}%")
+                return symbol, 0.0
+
+            # 4. MACD Bullish Cross Check
+            macd_line, signal_line, _ = talib.MACD(daily_df['close'])
+            macd_bullish = (macd_line.iloc[-1] > signal_line.iloc[-1] and 
+                           macd_line.iloc[-2] <= signal_line.iloc[-2])
+            if not macd_bullish:
+                logger.info(f"{symbol} ❌ No MACD bullish cross")
+                return symbol, 0.0
+
+            # 5. Fibonacci Retracement Check
+            swing_high = daily_df['high'].rolling(50).max().iloc[-1]
+            swing_low = daily_df['low'].rolling(50).min().iloc[-1]
+            fib_levels = {
+                0.382: swing_high - (swing_high - swing_low) * 0.382,
+                0.5: swing_high - (swing_high - swing_low) * 0.5,
+                0.618: swing_high - (swing_high - swing_low) * 0.618
             }
             
-            sentiment_score = await self.market_analyzer.get_market_sentiment(price_data, symbol)
-            tech_signals = self.market_analyzer.calculate_signals(df)
+            near_fib = any(abs(current_close - level) < current_close * 0.015 
+                          for level in fib_levels.values())
+            if not near_fib:
+                logger.info(f"{symbol} ❌ Not near Fibonacci levels")
+                return symbol, 0.0
+
+            # 6. Volume Confirmation
+            volume_ma = daily_df['volume'].rolling(20).mean().iloc[-1]
+            volume_ok = daily_df['volume'].iloc[-1] > volume_ma * 1.2
+            if not volume_ok:
+                logger.info(f"{symbol} ❌ Insufficient volume")
+                return symbol, 0.0
+
+            # Calculate final confidence score (0-10)
+            confidence = 0.0
             
-            # Composite score (lines 537-543)
-            confidence = (sentiment_score + tech_signals['signal_strength']) * 5  # Scale 0-10
-            logger.info(f"Symbol {symbol} score: Sentiment {sentiment_score:.2f}, Tech {tech_signals['signal_strength']:.2f} → {confidence:.2f}")
-            
-            if self.is_weekend():
-                confidence *= 1.2  # 20% weekend volatility bonus
-                logger.info(f"Weekend adjustment → {confidence:.2f}")
+            # Base score from technical alignment
+            confidence += 2.0  # EMA alignment
+            confidence += min(2.0, (rsi - 50) / 10)  # RSI contribution
+            confidence += min(2.0, atr_pct / 2)  # ATR contribution
+            confidence += 2.0 if macd_bullish else 0  # MACD
+            confidence += 1.0 if near_fib else 0  # Fibonacci
+            confidence += 1.0 if volume_ok else 0  # Volume
+
+            logger.info(f"{symbol} ✅ Passed all filters with confidence: {confidence:.2f}")
+            logger.info(f"  - RSI: {rsi:.2f}")
+            logger.info(f"  - ATR: {atr_pct:.2f}%")
+            logger.info(f"  - Volume: {daily_df['volume'].iloc[-1]/volume_ma:.1f}x average")
             
             return symbol, confidence
-            
+
         except Exception as e:
             logger.error(f"Analysis failed for {symbol}: {e}")
             return symbol, 0.0
@@ -3538,84 +3601,71 @@ class KrakenAdvancedGridStrategy:
             return False
 
     async def _analyze_daily(self, df: pd.DataFrame, symbol: str) -> bool:
-        """Enhanced daily analysis with reversal confirmation"""
+        """Strict daily chart analysis with fib retracement confirmation"""
         try:
-            # Existing swing/EMA analysis
-            support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
+            # EMA Structure
+            df['ema9'] = talib.EMA(df['close'], 9)
+            df['ema21'] = talib.EMA(df['close'], 21)
+            df['ema200'] = talib.EMA(df['close'], 200)
             
-            # Get current price from the existing pattern
-            current_price = float(df['close'].iloc[-1])
+            current_close = df['close'].iloc[-1]
+            ema9 = df['ema9'].iloc[-1]
+            ema21 = df['ema21'].iloc[-1]
+            ema200 = df['ema200'].iloc[-1]
             
-            # Add 200 EMA trend check
-            ema200 = talib.EMA(df['close'], 200).iloc[-1]
-            price_above_ema200 = current_price > ema200
+            # 1. EMA Alignment Check
+            ema_cross = ema9 > ema21 and df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
+            above_ema200 = current_close > ema200
             
-            # Determine market state (matches line 3507-3515)
-            market_state = "bull" if price_above_ema200 else "bear"
-            
-            logger.info(f"200 EMA: {ema200:.4f}")
-            logger.info(f"Market State: {market_state.upper()} | Price vs 200 EMA: {'✅ Above' if price_above_ema200 else '❌ Below'}")
-            
-            # New reversal indicators
+            # 2. RSI and ATR Requirements
             rsi = talib.RSI(df['close'], 14).iloc[-1]
-            rsi_prev = talib.RSI(df['close'], 14).iloc[-2]
-            macd_line, signal_line, _ = talib.MACD(df['close'])
-            
-
-            # Dynamic criteria based on market state
-            rsi_threshold = 30 if market_state == "bull" else 25
-            volume_multiplier = 1.25 if market_state == "bull" else 1.1
-            
-            # Bullish reversal criteria
-            rsi_bullish = (rsi > rsi_threshold) and (rsi_prev <= rsi_threshold)
-            macd_bullish = (macd_line.iloc[-1] > signal_line.iloc[-1]) and \
-                          (macd_line.iloc[-2] <= signal_line.iloc[-2])
-            
-            logger.info(f"Daily Reversal Checks:")
-            logger.info(f"RSI Cross >{rsi_threshold}: {'✅' if rsi_bullish else '❌'} ({rsi_prev:.1f} → {rsi:.1f})")
-            logger.info(f"MACD Bull Cross: {'✅' if macd_bullish else '❌'}")
-
-            # ATR validation with market-based ranges
             atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            atr_pct = (atr / current_price) * 100
-            atr_min, atr_max = (2.0, 4.0) if market_state == "bear" else (1.5, 5.0)
+            atr_pct = (atr / current_close) * 100
             
+            # 3. MACD Cross
+            macd_line, signal_line, _ = talib.MACD(df['close'])
+            macd_bullish = (macd_line.iloc[-1] > signal_line.iloc[-1] and 
+                           macd_line.iloc[-2] <= signal_line.iloc[-2])
+            
+            # 4. Fibonacci Retracement Levels
+            swing_high = df['high'].rolling(50).max().iloc[-1]
+            swing_low = df['low'].rolling(50).min().iloc[-1]
+            fib_levels = {
+                0.382: swing_high - (swing_high - swing_low) * 0.382,
+                0.5: swing_high - (swing_high - swing_low) * 0.5,
+                0.618: swing_high - (swing_high - swing_low) * 0.618
+            }
+            
+            # Check if price is retracing to fib levels
+            near_fib = any(abs(current_close - level) < current_close * 0.015 
+                          for level in fib_levels.values())
+            
+            # 5. Volume Confirmation (current > 20-period average)
+            volume_ma = df['volume'].rolling(20).mean().iloc[-1]
+            volume_ok = df['volume'].iloc[-1] > volume_ma * 1.2
+            
+            logger.info(f"DAILY ANALYSIS ({symbol}):")
+            logger.info(f"EMA 9/21 Cross: {'✅' if ema_cross else '❌'}")
+            logger.info(f"Price > EMA200: {'✅' if above_ema200 else '❌'} ({ema200:.4f})")
+            logger.info(f"RSI > 50: {'✅' if rsi > 50 else '❌'} ({rsi:.2f})")
+            logger.info(f"ATR > 1.5%: {'✅' if atr_pct > 1.5 else '❌'} ({atr_pct:.2f}%)")
+            logger.info(f"MACD Bull Cross: {'✅' if macd_bullish else '❌'}")
+            logger.info(f"Near Fib Level: {'✅' if near_fib else '❌'}")
+            logger.info(f"Volume Spike: {'✅' if volume_ok else '❌'}")
 
-            logger.info(f"Daily ATR: {atr_pct:.1f}%")
-            
-            if not (atr_min <= atr_pct <= atr_max):
-                logger.info(f"❌ Daily ATR out of {market_state} range ({atr_min}-{atr_max}%): {atr_pct:.1f}%")
-                return False
-
-            # Volume validation with dynamic multiplier
-            volume = df['volume'].iloc[-1]
-            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
-            strong_volume = volume > vol_ma * volume_multiplier
-            
-            logger.info(f"Volume Check: {volume:,.2f} vs MA {vol_ma:,.2f}")
-            logger.info(f"Volume Strength: {'✅' if strong_volume else '❌'} (Req: {volume_multiplier}x)")
-            
-            # Combined validation with market-specific rules
-            return (
-                (price_above_ema200 if market_state == "bull" else True) and
-                self._ema_bullish_cross(df) and
-                (rsi_bullish or macd_bullish) and
-                strong_volume and
-                (await self._price_position_checks(current_price, support_levels, resistance_levels))
-            )
+            return all([
+                ema_cross,
+                above_ema200,
+                rsi > 50,
+                atr_pct > 1.5,
+                macd_bullish,
+                near_fib,
+                volume_ok
+            ])
             
         except Exception as e:
             logger.error(f"Daily analysis error: {e}")
             return False
-
-    def _ema_bullish_cross(self, df: pd.DataFrame) -> bool:
-        """Existing EMA cross check from line 3447-3466"""
-        df['ema9'] = talib.EMA(df['close'], timeperiod=9)
-        df['ema21'] = talib.EMA(df['close'], timeperiod=21)
-        current_cross = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
-        previous_cross = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
-        return current_cross and previous_cross
-
 
     async def _analyze_4h(self, df: pd.DataFrame, symbol: str) -> bool:
         """4-hour trend analysis - Relaxed Version"""
