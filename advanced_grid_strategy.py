@@ -2672,10 +2672,10 @@ class KrakenAdvancedGridStrategy:
         return tech_boost
 
     async def update_trading_symbols(self) -> None:
-        """Dynamically update trading symbols based on account growth and volume"""
+        """Dynamically update trading symbols based on account growth and technical analysis"""
         try:
             current_time = time.time()
-            if current_time - self.last_symbol_update < 3600:
+            if current_time - self.last_symbol_update < 3600:  # Still check hourly
                 return
 
             logger.info("\n=== Updating Trading Symbols ===")
@@ -2702,11 +2702,11 @@ class KrakenAdvancedGridStrategy:
                 new_symbols.extend(self.tier4_symbols)
                 logger.info("Account above $5000 - Adding ETH and remaining symbols")
 
-            # Apply volume and price filters BEFORE setting active symbols
-            logger.info(f"Filtering {len(new_symbols)} initial symbols...")
+            # Apply technical analysis filter using our daily criteria
+            logger.info(f"Analyzing {len(new_symbols)} symbols for technical setups...")
             filtered_symbols = await self.filter_symbols(new_symbols)
             
-            logger.info(f"Filtered down to top {len(filtered_symbols)} symbols by volume")
+            logger.info(f"Found {len(filtered_symbols)} symbols matching our criteria")
             self.active_symbols = filtered_symbols
             
             self.last_symbol_update = current_time
@@ -3328,17 +3328,16 @@ class KrakenAdvancedGridStrategy:
             # Stage 0: Remove blacklisted symbols
             filtered = [s for s in symbols if s not in self.STABLE_BLACKLIST]
             
-            # Stage 1: Liquidity filter
-            liquidity_filtered = await self._quick_liquidity_filter(filtered)
+            logger.info(f"Starting analysis of {len(filtered)} symbols")
             
-            # Stage 2: Parallel market analysis with daily requirements
+            # Stage 1: Parallel market analysis with daily requirements
             analysis_tasks = [
                 self._analyze_symbol(sym)
-                for sym in liquidity_filtered[:20]  # Analyze top 20
+                for sym in filtered  # Analyze all symbols now that liquidity filter is removed
             ]
             results = await asyncio.gather(*analysis_tasks)
             
-            # Stage 3: Only keep symbols that passed daily analysis (confidence > 0)
+            # Stage 2: Only keep symbols that passed daily analysis (confidence > 0)
             valid_symbols = [(sym, score) for sym, score in results if score > 7.0]  # Requiring 70% confidence
             
             if not valid_symbols:
@@ -3359,6 +3358,34 @@ class KrakenAdvancedGridStrategy:
             
         except Exception as e:
             logger.error(f"Filter error: {e}")
+            return []
+
+    async def scan_market(self):
+        """Enhanced market scanner with detailed logging"""
+        try:
+            logger.info("\n🔍 Starting Market Scan...")
+            
+            # Get all available symbols
+            markets = await self.exchange.load_markets()
+            all_symbols = [market for market in markets.keys() 
+                          if market.endswith('/USD')]  # Only USD pairs
+            
+            logger.info(f"Found {len(all_symbols)} USD pairs")
+            
+            # Filter symbols
+            filtered_symbols = await self.filter_symbols(all_symbols)
+            
+            if filtered_symbols:
+                logger.info("\n🎯 Top Trading Opportunities:")
+                for symbol in filtered_symbols:
+                    logger.info(f"- {symbol}")
+            else:
+                logger.info("❌ No symbols passed filtering criteria")
+                
+            return filtered_symbols
+            
+        except Exception as e:
+            logger.error(f"Market scan error: {e}")
             return []
 
     async def _analyze_symbol(self, symbol: str) -> Tuple[str, float]:
