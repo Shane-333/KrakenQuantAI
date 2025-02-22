@@ -2273,33 +2273,39 @@ class KrakenAdvancedGridStrategy:
                     self.market_scan_task.cancel()
                 try:
                     await self.exchange.close()
-                except:
+                except: 
                     pass
 
     async def background_market_scan(self):
-        """Enhanced scanner that finds candidates for filtering"""
+        """Enhanced scanner that finds candidates using strict daily analysis"""
         try:
-            # Get all available symbols from exchange
-            all_markets = await self.exchange.fetch_markets()
-            all_symbols = [m['symbol'] for m in all_markets if m['active']]
+            logger.info("\n🔍 Starting Background Market Scan...")
             
-            # Scan for symbols meeting basic conditions
-            scan_tasks = [
-                self._scan_symbol(sym) 
-                for sym in all_symbols[:50]  # Scan top 50 by default
-            ]
-            candidates = await asyncio.gather(*scan_tasks)
-            valid_candidates = [sym for sym in candidates if sym]
+            # Get all symbols from our symbol map
+            all_symbols = list(self.symbol_map.values())
+            logger.info(f"Scanning {len(all_symbols)} available symbols")
             
-            # Pass candidates through full filtering
-            self.active_symbols = await self.filter_symbols(valid_candidates)
+            # Apply our strict daily analysis filter
+            filtered_symbols = await self.filter_symbols(all_symbols)
             
-            logger.info(f"Updated trading symbols: {self.active_symbols}")
+            if filtered_symbols:
+                logger.info("\n🎯 Top Trading Opportunities:")
+                for symbol in filtered_symbols:
+                    logger.info(f"- {symbol}")
+                
+                # Update active symbols with the filtered results
+                self.active_symbols = filtered_symbols
+                logger.info(f"Updated active symbols: {self.active_symbols}")
+            else:
+                logger.info("❌ No symbols passed strict daily analysis criteria")
+                
+            await asyncio.sleep(300)  # Scan every 5 minutes
 
         except asyncio.CancelledError:
             logger.info("Background market scanner stopped")
         except Exception as e:
             logger.error(f"Error in background market scanner: {e}")
+            await asyncio.sleep(60)  # Wait 1 minute on error
 
     async def _scan_symbol(self, symbol: str) -> Union[str, None]:
         """Market scanner pre-filter using analyzer conditions"""
