@@ -3395,14 +3395,13 @@ class KrakenAdvancedGridStrategy:
             return []
 
     async def _analyze_symbol(self, symbol: str) -> Tuple[str, float]:
-        """Market analyzer-powered symbol validation with strict daily requirements"""
+        """Market analyzer for breakout validation with daily fib levels"""
         try:
-            # Get daily timeframe data
-            daily_df = await self.get_historical_data(symbol, '1d', limit=200)  # Increased limit for better analysis
-            if daily_df is None or len(daily_df) < 200:  # Need enough data for 200 EMA
+            daily_df = await self.get_historical_data(symbol, '1d', limit=200)
+            if daily_df is None or len(daily_df) < 200:
                 return symbol, 0.0
 
-            # 1. EMA Structure Check
+            # Calculate EMAs
             daily_df['ema9'] = talib.EMA(daily_df['close'], 9)
             daily_df['ema21'] = talib.EMA(daily_df['close'], 21)
             daily_df['ema200'] = talib.EMA(daily_df['close'], 200)
@@ -3412,72 +3411,79 @@ class KrakenAdvancedGridStrategy:
             ema21 = daily_df['ema21'].iloc[-1]
             ema200 = daily_df['ema200'].iloc[-1]
             
-            # Check EMA alignment and crossover
-            ema_cross = ema9 > ema21 and daily_df['ema9'].iloc[-2] <= daily_df['ema21'].iloc[-2]
-            above_ema200 = current_close > ema200
+            # 1. EMA Breakout Check
+            ema_cross = (ema9 > ema21 and 
+                        daily_df['ema9'].iloc[-2] <= daily_df['ema21'].iloc[-2] and
+                        current_close > ema200)
             
-            if not (ema_cross and above_ema200):
-                logger.info(f"{symbol} ❌ Failed EMA requirements")
+            if not ema_cross:
+                logger.info(f"{symbol} ❌ No EMA breakout")
                 return symbol, 0.0
 
-            # 2. RSI Check
-            rsi = talib.RSI(daily_df['close'], 14).iloc[-1]
-            if rsi <= 50:
-                logger.info(f"{symbol} ❌ RSI below 50: {rsi:.2f}")
+            # 2. RSI Cross Above Signal
+            rsi = talib.RSI(daily_df['close'], 14)
+            rsi_signal = talib.SMA(rsi, 14)  # 14-period signal line
+            rsi_cross = (rsi.iloc[-1] > rsi_signal.iloc[-1] and 
+                        rsi.iloc[-2] <= rsi_signal.iloc[-2])
+            
+            if not rsi_cross:
+                logger.info(f"{symbol} ❌ No RSI cross")
                 return symbol, 0.0
 
-            # 3. ATR Volatility Check
+            # 3. MACD Breakout
+            macd_line, signal_line, _ = talib.MACD(daily_df['close'])
+            macd_cross = (macd_line.iloc[-1] > signal_line.iloc[-1] and 
+                         macd_line.iloc[-2] <= signal_line.iloc[-2])
+            
+            if not macd_cross:
+                logger.info(f"{symbol} ❌ No MACD cross")
+                return symbol, 0.0
+
+            # 4. ATR Volatility Check
             atr = talib.ATR(daily_df['high'], daily_df['low'], daily_df['close'], 14).iloc[-1]
             atr_pct = (atr / current_close) * 100
             if atr_pct <= 1.5:
                 logger.info(f"{symbol} ❌ ATR too low: {atr_pct:.2f}%")
                 return symbol, 0.0
 
-            # 4. MACD Bullish Cross Check
-            macd_line, signal_line, _ = talib.MACD(daily_df['close'])
-            macd_bullish = (macd_line.iloc[-1] > signal_line.iloc[-1] and 
-                           macd_line.iloc[-2] <= signal_line.iloc[-2])
-            if not macd_bullish:
-                logger.info(f"{symbol} ❌ No MACD bullish cross")
+            # 5. Volume Breakout
+            volume = daily_df['volume'].iloc[-1]
+            vol_ma = daily_df['volume'].rolling(20).mean().iloc[-1]
+            volume_breakout = volume > vol_ma * 1.5  # 50% above average
+            
+            if not volume_breakout:
+                logger.info(f"{symbol} ❌ No volume breakout")
                 return symbol, 0.0
 
-            # 5. Fibonacci Retracement Check
+            # 6. Breaking Above Fib Levels
             swing_high = daily_df['high'].rolling(50).max().iloc[-1]
             swing_low = daily_df['low'].rolling(50).min().iloc[-1]
-            fib_levels = {
-                0.382: swing_high - (swing_high - swing_low) * 0.382,
-                0.5: swing_high - (swing_high - swing_low) * 0.5,
-                0.618: swing_high - (swing_high - swing_low) * 0.618
-            }
+            fib_levels = [
+                swing_high - (swing_high - swing_low) * level 
+                for level in [0.236, 0.382, 0.5, 0.618, 0.786]
+            ]
             
-            near_fib = any(abs(current_close - level) < current_close * 0.015 
-                          for level in fib_levels.values())
-            if not near_fib:
-                logger.info(f"{symbol} ❌ Not near Fibonacci levels")
+            # Check if breaking above any fib level with volume
+            breaking_fib = any(
+                current_close > level and daily_df['close'].iloc[-2] <= level 
+                for level in fib_levels
+            )
+            
+            if not breaking_fib:
+                logger.info(f"{symbol} ❌ No fib breakout")
                 return symbol, 0.0
 
-            # 6. Volume Confirmation
-            volume_ma = daily_df['volume'].rolling(20).mean().iloc[-1]
-            volume_ok = daily_df['volume'].iloc[-1] > volume_ma * 1.2
-            if not volume_ok:
-                logger.info(f"{symbol} ❌ Insufficient volume")
-                return symbol, 0.0
-
-            # Calculate final confidence score (0-10)
+            # Calculate confidence score (0-10)
             confidence = 0.0
-            
-            # Base score from technical alignment
-            confidence += 2.0  # EMA alignment
-            confidence += min(2.0, (rsi - 50) / 10)  # RSI contribution
-            confidence += min(2.0, atr_pct / 2)  # ATR contribution
-            confidence += 2.0 if macd_bullish else 0  # MACD
-            confidence += 1.0 if near_fib else 0  # Fibonacci
-            confidence += 1.0 if volume_ok else 0  # Volume
+            confidence += 2.0  # EMA breakout
+            confidence += 2.0  # RSI cross
+            confidence += 2.0  # MACD cross
+            confidence += min(2.0, atr_pct / 2)  # ATR
+            confidence += 2.0 if volume > vol_ma * 2 else 1.0  # Volume strength
 
-            logger.info(f"{symbol} ✅ Passed all filters with confidence: {confidence:.2f}")
-            logger.info(f"  - RSI: {rsi:.2f}")
+            logger.info(f"{symbol} ✅ Breakout detected! Confidence: {confidence:.2f}")
             logger.info(f"  - ATR: {atr_pct:.2f}%")
-            logger.info(f"  - Volume: {daily_df['volume'].iloc[-1]/volume_ma:.1f}x average")
+            logger.info(f"  - Volume: {volume/vol_ma:.1f}x average")
             
             return symbol, confidence
 
