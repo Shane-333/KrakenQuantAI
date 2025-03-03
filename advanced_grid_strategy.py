@@ -7,14 +7,12 @@ import pandas as pd
 import numpy as np
 import ta
 import talib
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime
 import time
 import traceback
-import pytz
 from market_analysis import MarketAnalyzer
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,11 +20,6 @@ logger = logging.getLogger(__name__)
 class KrakenAdvancedGridStrategy:
     def __init__(self, demo_mode=False):  # Set default to False for live
         self.demo_mode = demo_mode
-        self.STABLE_BLACKLIST = {
-        'EUR/USD', 'USDC/USD', 'USDT/USD', 'AUD/USD', 'FARTCOIN/USD', 'PEPE/USD', 'BONK/USD', 'SHIB/USD', 'GBP/USD', 'JPY/USD', 'CHF/USD', 'NZD/USD', 'CAD/USD', 'HKD/USD', 'SGD/USD', 'NOK/USD', 'SEK/USD', 'AUD/JPY', 'NZD/JPY', 'CAD/JPY', 'HKD/JPY', 'SGD/JPY', 'NOK/JPY', 'SEK/JPY'
-        'EUR/USD:USD', 'USDC/USD:USD', 'USDT/USD:USD', 'AUD/USD:USD', 'FARTCOIN/USD:USD', 'PEPE/USD:USD', 'BONK/USD:USD', 'SHIB/USD:USD', 'GBP/USD:USD', 'JPY/USD:USD', 'CHF/USD:USD', 'NZD/USD:USD', 'CAD/USD:USD', 'HKD/USD:USD', 'SGD/USD:USD', 'NOK/USD:USD', 'SEK/USD:USD', 'AUD/JPY:USD', 'NZD/JPY:USD', 'CAD/JPY:USD', 'HKD/JPY:USD', 'SGD/JPY:USD', 'NOK/JPY:USD', 'SEK/JPY:USD'
-        }
-
         
         # Load environment variables
         load_dotenv()
@@ -178,19 +171,6 @@ class KrakenAdvancedGridStrategy:
         
         # Remove training task creation from here
         self.training_tasks = []  # Just initialize empty list
-        self.has_sufficient_funds = True  # Add this line to initialize the attribute
-
-        # Add this line in your __init__
-        self.atr_periods = 14  # Standard 14-period ATR
-        self.is_spot = False  # Default to False
-
-        # Add this line to initialize the attribute
-        self.min_position_size = 0.01  # Default value
-
-        # Initialize risk management parameters
-        self.risk_per_trade = 0.01 
-        self.max_portfolio_risk = 0.20  # 10% default
-        logger.info(f"Strategy initialized with risk_per_trade={self.risk_per_trade*100}%")
 
     def initialize_exchange(self) -> None:
         """Initialize CCXT exchange connection"""
@@ -250,7 +230,7 @@ class KrakenAdvancedGridStrategy:
             return 0.0
 
     async def get_open_positions(self) -> List[Dict]:
-        """Get open positions including both spot and margin/futures"""
+        """Get open positions including both spot and margin/futures with FIFO tracking"""
         try:
             active_positions = []
             
@@ -263,36 +243,101 @@ class KrakenAdvancedGridStrategy:
                 total_amount = float(amount)
                 if total_amount > 0.00001:  # Minimum threshold
                     try:
-                        # Get proper normalized symbol
-                        symbol = self.normalize_symbol(f"{currency}/USD")
+                        symbol = f"{currency}/USD"
                         
-                        # Get current price from order book spread
-                        orderbook = await self.exchange.fetch_order_book(symbol)
-                        bid = orderbook['bids'][0][0] if orderbook['bids'] else 0
-                        ask = orderbook['asks'][0][0] if orderbook['asks'] else 0
-                        mid_price = (bid + ask) / 2
+                        # Get the entry price from CLOSED order history (not open orders)
+                        closed_orders = await self.exchange.fetch_closed_orders(symbol, limit=10)
                         
-                        # Calculate entry price using spread-adjusted mid price
-                        entry_price = await self.get_average_entry_price(symbol, total_amount, mid_price)
+                        # Filter for buy orders that were filled
+                        filled_buys = [o for o in closed_orders if o['side'] == 'buy' and o['status'] == 'closed']
                         
-                        position = {
-                            'symbol': symbol,
-                            'info': {
+                        # Sort by timestamp for FIFO tracking (oldest first)
+                        filled_buys.sort(key=lambda x: x['timestamp'])
+                        
+                        if filled_buys:
+                            # Calculate weighted average entry price for FIFO tracking
+                            total_cost = 0
+                            total_quantity = 0
+                            
+                            # Log all entry points for FIFO tracking
+                            logger.info(f"\nFIFO Entry Points for {symbol}:")
+                            for i, order in enumerate(filled_buys):
+                                order_price = float(order['price'])
+                                order_amount = float(order['filled'])
+                                order_cost = order_price * order_amount
+                                order_time = datetime.fromtimestamp(order['timestamp']/1000)
+                                
+                                total_cost += order_cost
+                                total_quantity += order_amount
+                                
+                                logger.info(f"Entry #{i+1}: {order_amount} @ ${order_price} on {order_time}")
+                            
+                            # Calculate weighted average entry
+                            avg_entry_price = total_cost / total_quantity if total_quantity > 0 else 0
+                            
+                            logger.info(f"Found actual spot position for {symbol}:")
+                            logger.info(f"Balance: {total_amount} {currency}")
+                            logger.info(f"FIFO Entries: {len(filled_buys)} orders")
+                            logger.info(f"Avg Entry: ${avg_entry_price:.4f}")
+                            
+                            spot_position = {
                                 'symbol': symbol,
-                                'size': total_amount,
-                                'price': entry_price,  # Use spread-adjusted price
-                                'side': 'long',
-                                'is_spot': True
+                                'info': {
+                                    'symbol': symbol,
+                                    'size': total_amount,
+                                    'price': avg_entry_price,
+                                    'side': 'long',
+                                    'is_spot': True,
+                                    'fifo_entries': filled_buys  # Store FIFO entries for later use
+                                }
                             }
-                        }
-                        active_positions.append(position)
+                            
+                            active_positions.append(spot_position)
+                            logger.info(f"Active spot position: {symbol}: long {total_amount} @ {avg_entry_price:.4f}")
+                        else:
+                            logger.warning(f"No entry orders found for {symbol} despite having balance of {total_amount}")
+                            
+                            # Fallback to current price if no entry orders found
+                            current_price = await self.get_current_price(symbol)
+                            if current_price:
+                                spot_position = {
+                                    'symbol': symbol,
+                                    'info': {
+                                        'symbol': symbol,
+                                        'size': total_amount,
+                                        'price': current_price,
+                                        'side': 'long',
+                                        'is_spot': True,
+                                        'fifo_entries': []  # Empty FIFO entries
+                                    }
+                                }
+                                active_positions.append(spot_position)
+                                logger.info(f"Using current price as entry: {symbol}: long {total_amount} @ {current_price}")
                     except Exception as e:
-                        logger.error(f"Error processing {currency} position: {str(e)[:100]}")
+                        logger.error(f"Error processing {currency} balance: {e}")
                         continue
-            return active_positions
             
+            # Log summary of actual positions
+            if active_positions:
+                logger.info("\nActive Positions Summary:")
+                for pos in active_positions:
+                    symbol = pos['info']['symbol']
+                    try:
+                        current_price = await self.get_current_price(symbol)
+                        if current_price:  # Only call manage_stop_loss if we have a valid price
+                            await self.manage_stop_loss(symbol, pos, current_price)
+                            logger.info(f"{symbol}: {pos['info']['side']} {pos['info']['size']} @ {pos['info']['price']}")
+                        else:
+                            logger.error(f"Could not get current price for {symbol}")
+                    except Exception as e:
+                        logger.error(f"Error processing position for {symbol}: {e}")
+            else:
+                logger.info("No active positions found")
+            
+            return active_positions
+                
         except Exception as e:
-            logger.error(f"Failed to get open positions: {e}")
+            logger.error(f"Error getting open positions: {e}")
             return []
 
     async def get_historical_data(self, symbol: str, timeframe: str = '1h', limit: int = 100) -> pd.DataFrame:
@@ -315,29 +360,17 @@ class KrakenAdvancedGridStrategy:
             
             interval = timeframe_minutes.get(timeframe, 60)  # Default to 1h
             
-            # Calculate required periods for all indicators
-            required_periods = max(
-                self.rsi_period,
-                self.ema_long_period,
-                self.bb_period,
-                self.atr_period,
-                self.macd_slow
-            )
-            
-            # Add buffer and fetch more data than needed
-            fetch_limit = max(limit, required_periods * 2)
-            
             # Get OHLCV data using Kraken's specific endpoint
             ohlcv = await self.exchange.fetch_ohlcv(
                 symbol, 
                 timeframe,
-                limit=fetch_limit,
+                limit=limit,
                 params={"interval": interval}
             )
             
-            if not ohlcv or len(ohlcv) < required_periods:
-                logger.error(f"Insufficient data for {symbol}. Need {required_periods} periods, got {len(ohlcv) if ohlcv else 0}")
-                return pd.DataFrame()
+            if not ohlcv:
+                logger.error(f"No OHLCV data returned for {symbol}")
+                return None
                 
             logger.info(f"Received {len(ohlcv)} candles for {symbol}")
             
@@ -346,233 +379,184 @@ class KrakenAdvancedGridStrategy:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             
-            # Ensure minimum required data
-            if len(df) < required_periods:
-                logger.warning(f"Insufficient data ({len(df)} rows) for {symbol}. Need {required_periods} periods")
-                return pd.DataFrame()
-
-            # Wrap each indicator in try/except
-            try:
-                df['rsi'] = talib.RSI(df['close'], timeperiod=14)
-            except Exception as e:
-                logger.error(f"RSI Error for {symbol}: {e}")
-                df['rsi'] = np.nan
-
-            try:
-                df['ema_short'] = ta.trend.EMAIndicator(df['close'], self.ema_short_period).ema_indicator()
-                df['ema_long'] = ta.trend.EMAIndicator(df['close'], self.ema_long_period).ema_indicator()
-            except Exception as e:
-                logger.error(f"EMA Error for {symbol}: {e}")
-                df['ema_short'] = df['close']
-                df['ema_long'] = df['close']
-
-            try:
-                df['atr'] = ta.volatility.AverageTrueRange(
-                    df['high'], 
-                    df['low'], 
-                    df['close'], 
-                    window=self.atr_period
-                ).average_true_range()
-            except Exception as e:
-                logger.error(f"ATR Error for {symbol}: {e}")
-                df['atr'] = 0
+            # Calculate existing indicators
+            df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
+            df['ema_short'] = ta.trend.EMAIndicator(df['close'], self.ema_short_period).ema_indicator()
+            df['ema_long'] = ta.trend.EMAIndicator(df['close'], self.ema_long_period).ema_indicator()
+            df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], self.atr_period).average_true_range()
             
-            # Calculate MACD with error handling
-            try:
-                macd_line, signal_line, macd_hist = talib.MACD(
-                    df['close'], 
-                    fastperiod=self.macd_fast,  # Correct parameter name
-                    slowperiod=self.macd_slow,   # Correct parameter name
-                    signalperiod=self.macd_signal
-                )
-                df['macd'] = macd_line
-                df['macd_signal'] = signal_line
-                df['macd_histogram'] = macd_hist
-            except Exception as e:
-                logger.error(f"MACD Error for {symbol}: {e}")
-                df['macd'] = 0
-                df['macd_signal'] = 0
-                df['macd_histogram'] = 0
+            # Calculate MACD
+            macd = ta.trend.MACD(
+                df['close'], 
+                window_slow=self.macd_slow, 
+                window_fast=self.macd_fast, 
+                window_sign=self.macd_signal
+            )
+            df['macd'] = macd.macd()
+            df['macd_signal'] = macd.macd_signal()
+            df['macd_histogram'] = macd.macd_diff()
             
-            # Calculate Bollinger Bands with error handling
-            try:
-                bollinger = ta.volatility.BollingerBands(
-                    df['close'],
-                    window=self.bb_period,
-                    window_dev=self.bb_std
-                )
-                df['bb_upper'] = bollinger.bollinger_hband()
-                df['bb_middle'] = bollinger.bollinger_mavg()
-                df['bb_lower'] = bollinger.bollinger_lband()
-                
-                # Calculate Bollinger Band Width
-                df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
-            except Exception as e:
-                logger.error(f"Bollinger Bands Error for {symbol}: {e}")
-                df['bb_upper'] = df['close']
-                df['bb_middle'] = df['close']
-                df['bb_lower'] = df['close']
-                df['bb_width'] = 0
+            # Calculate Bollinger Bands
+            bollinger = ta.volatility.BollingerBands(
+                df['close'],
+                window=self.bb_period,
+                window_dev=self.bb_std
+            )
+            df['bb_upper'] = bollinger.bollinger_hband()
+            df['bb_middle'] = bollinger.bollinger_mavg()
+            df['bb_lower'] = bollinger.bollinger_lband()
             
-            # Drop any NaN values and return a copy
-            df_clean = df.dropna().copy()
+            # Calculate Bollinger Band Width
+            df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
             
-            if len(df_clean) > 0:
-                logger.info(f"Calculated indicators for {symbol}:")
-                logger.info(f"Latest RSI: {df_clean['rsi'].iloc[-1]:.2f}")
-                logger.info(f"Latest MACD: {df_clean['macd'].iloc[-1]:.4f}")
-                logger.info(f"Latest BB Width: {df_clean['bb_width'].iloc[-1]:.4f}")
+            logger.info(f"Calculated all indicators for {symbol}")
+            logger.info(f"Latest RSI: {df['rsi'].iloc[-1]:.2f}")
+            logger.info(f"Latest MACD: {df['macd'].iloc[-1]:.4f}")
+            logger.info(f"Latest BB Width: {df['bb_width'].iloc[-1]:.4f}")
             
-            return df_clean
+            return df
                 
         except Exception as e:
-            logger.error(f"Historical data error for {symbol}: {str(e)[:200]}")
-            return pd.DataFrame()
+            logger.error(f"Error getting historical data for {symbol}: {e}")
+            return None
 
     async def analyze_market_conditions(self, df: pd.DataFrame, symbol: str) -> Tuple[bool, float]:
         """Analyze market conditions using technical indicators and FinBERT sentiment"""
         try:
-            # Validate input DataFrame
-            if df is None or len(df) < 1:
-                logger.error(f"Invalid DataFrame for {symbol}")
-                return False, 0.0
-
-            # Add market state detection
-            daily_df = await self.get_historical_data(symbol, '1d')
-            if daily_df is not None and len(daily_df) >= 200:
-                daily_ma_200 = daily_df['close'].rolling(200).mean().iloc[-1]
-                current_daily_close = daily_df['close'].iloc[-1]
-                market_state = "bull" if current_daily_close > daily_ma_200 else "bear"
-                logger.info(f"Market State: {market_state.upper()}")
-                
-                min_sentiment = 0.55 if market_state == "bear" else 0.6
-                rsi_floor = 35 if market_state == "bear" else 30
-                max_volatility = 40 if market_state == "bear" else 60  # Allow higher volatility (40-60%)
-            else:
-                logger.warning("Using default thresholds - insufficient daily data")
-                min_sentiment = 0.6
-                rsi_floor = 30
-                max_volatility = 50  # Higher default volatility threshold
-
+            # Check if we have insufficient funds and there's no active position
             if not self.has_sufficient_funds and symbol not in self.active_positions:
-                return False, 0.0
-
+                return False, 0.0  # Skip analysis for new positions
+                
+            # Quick check for active positions first (always check regardless of funds)
             if symbol in self.active_positions:
-                current_price = float(df.iloc[-1]['close'])
+                current_price = df.iloc[-1]['close']
                 position = self.active_positions[symbol]
                 await self.manage_stop_loss(symbol, position, current_price)
-
+            
+            # Only continue analysis if we have funds or an active position
             if self.has_sufficient_funds or symbol in self.active_positions:
-                tasks = []
-                last_row = df.iloc[-1]
-                
-                # Format price data
-                price_data = {
-                    'timeframe': '1h',
-                    'price_data': {
-                        'open': df['open'].astype(float).tolist(),
-                        'high': df['high'].astype(float).tolist(),
-                        'low': df['low'].astype(float).tolist(),
-                        'close': df['close'].astype(float).tolist()
+                # Rest of existing analysis code...
+                async with asyncio.timeout(15):  # Increased from 5 to 15 seconds
+                    tasks = []
+                    last_row = df.iloc[-1]
+                    technical_data = {
+                        'technical': {
+                            'indicators': {
+                                'rsi': last_row['rsi'],
+                                'ema_short': last_row['ema_short'],
+                                'ema_long': last_row['ema_long'],
+                                'macd': last_row['macd'],
+                                'bb_width': last_row['bb_width'],
+                                'atr': last_row['atr']
+                            }
+                        }
                     }
-                }
-                
-                # Get sentiment analysis
-                try:
-                    sentiment_score = await self.market_analyzer.get_market_sentiment(
-                        data=price_data,  # Pass the price_data dictionary we created above
-                        symbol=symbol
+                    
+                    # Add timeout for sentiment analysis
+                    ai_task = asyncio.create_task(
+                        asyncio.wait_for(
+                            self.market_analyzer.get_market_sentiment(technical_data, symbol),
+                            timeout=15
+                        )
                     )
-                    sentiment_valid = sentiment_score >= min_sentiment
-                    logger.info(f"Sentiment score: {sentiment_score:.2f}")
-                except Exception as e:
-                    logger.error(f"Error getting sentiment: {e}")
-                    sentiment_score = 0.5
-                    sentiment_valid = False
-                
-                # Calculate technical signals
-                rsi = float(last_row['rsi'])
-                rsi_signal = rsi_floor <= rsi <= 70
-                ema_trend = float(last_row['ema_short']) > float(last_row['ema_long'])
-                macd_cross = float(last_row['macd']) > float(last_row['macd_signal'])
-                current_bbw = float(last_row['bb_width'])
-                bbw_valid = current_bbw < 0.5
-
-                # Calculate volatility
-                returns = df['close'].pct_change()
-                volatility = returns.std() * np.sqrt(252) * 100
-
-                # Calculate signal strength with sentiment
-                signal_strength = (
-                    (1 if rsi_signal else 0) +
-                    (1 if ema_trend else 0) +
-                    (1 if macd_cross else 0) +
-                    (1 if bbw_valid else 0) +
-                    (1 if sentiment_valid else 0)
-                ) / 5.0
-
-                should_trade = signal_strength >= 0.6 and volatility <= max_volatility
-
-                logger.info(f"Analysis complete - Signal: {signal_strength:.2f}, "
-                           f"Volatility: {volatility:.2f}%, Trade: {'✅' if should_trade else '❌'}")
-
-                return should_trade, volatility
-
+                    tasks.append(ai_task)
+                    
+                    # Task 2: Calculate technical signals concurrently
+                    def calculate_signals():
+                        rsi = last_row['rsi']
+                        rsi_signal = 30 <= rsi <= 70
+                        
+                        ema_trend = last_row['ema_short'] > last_row['ema_long']
+                        
+                        macd_cross = last_row['macd'] > last_row['macd_signal']
+                        
+                        current_bbw = last_row['bb_width']
+                        bbw_valid = current_bbw < 0.5
+                        
+                        return rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid
+                    
+                    # Run technical analysis in thread pool
+                    loop = asyncio.get_event_loop()
+                    tech_task = loop.run_in_executor(self.market_analyzer.thread_pool, calculate_signals)
+                    tasks.append(tech_task)
+                    
+                    # Wait for all tasks to complete
+                    sentiment_score, tech_signals = await asyncio.gather(*tasks)
+                    
+                    # Unpack technical signals
+                    rsi_signal, ema_trend, macd_cross, current_bbw, bbw_valid = tech_signals
+                    
+                    # Calculate final signals (using sentiment score directly)
+                    signal_strength = (
+                        (1 if rsi_signal else 0) +
+                        (1 if ema_trend else 0) +
+                        (1 if macd_cross else 0) +
+                        (1 if bbw_valid else 0) +
+                        (sentiment_score)  # Add sentiment as part of signal strength
+                    ) / 5.0
+                    
+                    should_trade = signal_strength >= 0.6  # Adjusted threshold
+                    
+                    logger.info(f"Analysis complete - Sentiment: {sentiment_score:.2f}, Signal: {signal_strength:.2f}, Trade: {'✅' if should_trade else '❌'}")
+                    
+                    return should_trade, current_bbw
+                    
+        except asyncio.TimeoutError:
+            logger.error(f"Analysis timeout for {symbol}")
+            return False, 0.0
         except Exception as e:
             logger.error(f"Error in market analysis: {e}")
             return False, 0.0
 
-    async def adjust_grid_parameters(self, volatility: float, current_price: float, symbol: str) -> None:
-        """Adjust grid parameters based on volatility"""
+    def adjust_grid_parameters(self, volatility_ratio: float, current_price: float) -> None:
+        """Adjust grid parameters based on market volatility and price"""
         try:
-            logger.info(f"\n{'='*30}")
-            logger.info("ADJUSTING GRID PARAMETERS")
-            logger.info(f"{'='*30}")
-            logger.info(f"Current volatility: {volatility:.2f}%")
+            # Price-based grid adjustments
+            if current_price >= 20000:  # BTC range
+                self.base_grid_spacing = 0.04    # 4% spacing
+                self.min_profit_threshold = 3.5   # Higher profit needed
+                position_multiplier = 1           # Standard size
+            elif current_price >= 1000:  # ETH range
+                self.base_grid_spacing = 0.035   # 3.5% spacing
+                self.min_profit_threshold = 3.0
+                position_multiplier = 1.5
+            elif current_price >= 100:   # High-value alts
+                self.base_grid_spacing = 0.03    # 3% spacing
+                self.min_profit_threshold = 2.5
+                position_multiplier = 2
+            elif current_price >= 10:    # Mid-value alts
+                self.base_grid_spacing = 0.025   # 2.5% spacing
+                self.min_profit_threshold = 2.0
+                position_multiplier = 3
+            elif current_price >= 1:     # Low-value alts
+                self.base_grid_spacing = 0.02    # 2% spacing
+                self.min_profit_threshold = 1.5
+                position_multiplier = 4
+            else:                        # Micro-price alts
+                self.base_grid_spacing = 0.015   # 1.5% spacing
+                self.min_profit_threshold = 1.0
+                position_multiplier = 5
+
+            # Adjust grid spacing with volatility
+            new_spacing = self.base_grid_spacing * volatility_ratio
+            self.grid_spacing = max(self.min_grid_spacing, min(self.max_grid_spacing, new_spacing))
             
-            # Base grid levels on volatility ranges
-            if volatility < 1.0:  # Low volatility
-                self.grid_levels = 3
-                self.grid_spacing = 0.008  # 0.8%
-                logger.info("Low volatility setup - Tighter grids")
-            elif 1.0 <= volatility < 2.0:  # Medium-low volatility
-                self.grid_levels = 4
-                self.grid_spacing = 0.012  # 1.2%
-                logger.info("Medium-low volatility setup")
-            elif 2.0 <= volatility < 3.0:  # Medium volatility
-                self.grid_levels = 5
-                self.grid_spacing = 0.015  # 1.5%
-                logger.info("Medium volatility setup")
-            elif 3.0 <= volatility < 4.0:  # Medium-high volatility
-                self.grid_levels = 6
-                self.grid_spacing = 0.018  # 1.8%
-                logger.info("Medium-high volatility setup")
-            else:  # High volatility
-                self.grid_levels = 7
-                self.grid_spacing = 0.02  # 2%
-                logger.info("High volatility setup - Wider grids")
-
-            # Adjust for minimum profitability - Use actual symbol here
-            min_profit_needed = await self.calculate_total_fees(current_price, self.min_position_size, symbol) * 2
-            min_grid_spacing = min_profit_needed / current_price
+            # Adjust grid levels based on price range and volatility
+            if current_price < 1:
+                base_levels = max(4, min(8, self.grid_levels))  # More levels for cheaper coins
+            else:
+                base_levels = self.grid_levels
+                
+            self.grid_levels = max(3, min(8, int(base_levels * volatility_ratio)))
             
-            if self.grid_spacing < min_grid_spacing:
-                self.grid_spacing = min_grid_spacing
-                logger.info(f"Adjusted grid spacing to ensure profitability: {self.grid_spacing*100:.2f}%")
-
-            # Update class attribute instead of local variable
-            self.min_position_size = 0.001 if current_price >= 20000 else 0.01
+            logger.info(f"Adjusted parameters for price ${current_price:.4f}:")
+            logger.info(f"Grid Spacing: {self.grid_spacing:.4f}")
+            logger.info(f"Grid Levels: {self.grid_levels}")
+            logger.info(f"Position Multiplier: {position_multiplier}x")
+            logger.info(f"Min Profit Threshold: ${self.min_profit_threshold}")
             
-            logger.info(f"Final grid spacing: {self.grid_spacing*100:.2f}%")
-            logger.info(f"Minimum position size: {self.min_position_size}")
-            logger.info(f"{'='*30}\n")
-
-            return True
-
         except Exception as e:
             logger.error(f"Error adjusting grid parameters: {e}")
-            return False
-            
 
     async def update_performance_metrics(self, trade_result: float) -> None:
         """Update strategy performance metrics with enhanced risk monitoring"""
@@ -736,7 +720,7 @@ class KrakenAdvancedGridStrategy:
         """Check if there are already grid orders placed for this symbol"""
         try:
             # Fetch all open orders for the symbol
-            open_orders = await self.exchange.fetch_open_orders(symbol)
+            open_orders = await self.exchange.fetch_closed_orders(symbol)
             
             if open_orders:
                 # Remove duplicates using set
@@ -788,49 +772,64 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error validating existing orders for {symbol}: {e}")
 
     async def calculate_support_resistance(self, df: pd.DataFrame, symbol: str) -> Tuple[List[float], List[float]]:
-        """Calculate support and resistance levels using daily, 15m and 5m timeframes"""
+        """Calculate support and resistance levels using daily, 1h and 15m timeframes"""
         try:
-            # Get multi-timeframe data
-            daily_df = await self.get_historical_data(symbol, '1d')
+            # Get multi-timeframe data with 1h instead of 5m
+            daily_df = await self.get_historical_data(symbol, timeframe='1d', limit=100)  # ~3 months
+            hourly_df = await self.get_historical_data(symbol, timeframe='1h', limit=168)  # ~7 days (1 week)
             fifteen_min_df = await self.get_historical_data(symbol, timeframe='15m', limit=100)  # ~24h
-            five_min_df = await self.get_historical_data(symbol, timeframe='5m', limit=72)      # Last 6h
             
-            if daily_df is None or fifteen_min_df is None or five_min_df is None:
+            if daily_df is None or hourly_df is None or fifteen_min_df is None:
                 logger.warning("No data available for S/R calculation")
                 return [], []
 
+            # Get current price for filtering
+            current_price = df['close'].iloc[-1]
+            
             # Calculate daily Fibonacci levels (structural)
             daily_high = daily_df['high'].max()
             daily_low = daily_df['low'].min()
             daily_diff = daily_high - daily_low
             
+            # Updated daily Fibonacci levels with both retracements and extensions
             daily_fib_levels = {
-                0: daily_low,
-                0.236: daily_high - (daily_diff * 0.236),
-                0.382: daily_high - (daily_diff * 0.382),
-                0.5: daily_high - (daily_diff * 0.5),
-                0.618: daily_high - (daily_diff * 0.618),
-                0.786: daily_high - (daily_diff * 0.786),
-                1: daily_high
+                # Support levels (retracements)
+                -1: daily_low - daily_diff,      # Extension below
+                0: daily_low,                    # Low point
+                0.236: daily_low + (daily_diff * 0.236),
+                0.382: daily_low + (daily_diff * 0.382),
+                0.5: daily_low + (daily_diff * 0.5),
+                0.618: daily_low + (daily_diff * 0.618),
+                0.786: daily_low + (daily_diff * 0.786),
+                1: daily_high,                   # High point
+                # Resistance levels (extensions)
+                1.414: daily_high + (daily_diff * 0.414),
+                1.618: daily_high + (daily_diff * 0.618),
+                2.618: daily_high + (daily_diff * 1.618),
+                3.618: daily_high + (daily_diff * 2.618),
+                4.236: daily_high + (daily_diff * 3.236)
             }
 
+            # Calculate hourly S/R (replacing 5min with 1h)
+            hourly_high = hourly_df['high'].rolling(window=24).max()  # 24 hours of data
+            hourly_low = hourly_df['low'].rolling(window=24).min()
+            
             # Calculate 15min S/R
             fifteen_high = fifteen_min_df['high'].rolling(window=20).max()
             fifteen_low = fifteen_min_df['low'].rolling(window=20).min()
             
-            # Calculate 5min Fibonacci levels (short-term)
-            recent_high = five_min_df['high'].max()
-            recent_low = five_min_df['low'].min()
+            # Calculate hourly Fibonacci levels (medium-term) - replacing 5min
+            recent_high = hourly_df['high'].max()
+            recent_low = hourly_df['low'].min()
             diff = recent_high - recent_low
             
-            short_term_fib_levels = {
-                -1: recent_high + diff,          # Extension below
+            hourly_fib_levels = {
                 0: recent_low,                   # Start level
-                0.236: recent_high - (diff * 0.236),
-                0.382: recent_high - (diff * 0.382),
-                0.5: recent_high - (diff * 0.5),
-                0.618: recent_high - (diff * 0.618),
-                0.786: recent_high - (diff * 0.786),
+                0.236: recent_low + (diff * 0.236),
+                0.382: recent_low + (diff * 0.382),
+                0.5: recent_low + (diff * 0.5),
+                0.618: recent_low + (diff * 0.618),
+                0.786: recent_low + (diff * 0.786),
                 1: recent_high,                  # End level
                 1.414: recent_high + (diff * 0.414),
                 1.618: recent_high + (diff * 0.618),
@@ -843,35 +842,71 @@ class KrakenAdvancedGridStrategy:
             resistance_levels = []
             support_levels = []
 
-            # Add daily levels first (highest priority)
-            for level in daily_fib_levels.values():
-                if level > recent_high:
+            # Define reasonable range for filtering (30% above and below current price)
+            upper_limit = current_price * 1.30
+            lower_limit = current_price * 0.70
+            
+            # Add daily levels with proper categorization and filtering
+            for level, value in daily_fib_levels.items():
+                if level >= 1 and value <= upper_limit:  # 1 and above are resistance
+                    resistance_levels.append(value)
+                elif level < 1 and value >= lower_limit:  # Below 1 are support
+                    support_levels.append(value)
+
+            # Add hourly levels (medium priority) with filtering
+            for level in hourly_high.dropna().tolist():
+                if level <= upper_limit:
                     resistance_levels.append(level)
-                elif level < recent_low:
+                    
+            for level in hourly_low.dropna().tolist():
+                if level >= lower_limit:
                     support_levels.append(level)
-
-            # Add 15min levels
-            resistance_levels.extend(fifteen_high.dropna().tolist())
-            resistance_levels.extend([
-                short_term_fib_levels[level] for level in [1.414, 1.618, 2.618, 3.618, 4.236]
-            ])
-            resistance_levels.append(recent_high)
-
-            # Add support levels
-            support_levels.extend(fifteen_low.dropna().tolist())
-            support_levels.extend([
-                short_term_fib_levels[level] for level in [0, 0.236, 0.382, 0.5, 0.618, 0.786]
-            ])
-            support_levels.append(recent_low)
+            
+            # Add hourly Fibonacci levels with filtering
+            for level in [1, 1.414, 1.618, 2.618, 3.618, 4.236]:
+                value = hourly_fib_levels[level]
+                if value <= upper_limit:
+                    resistance_levels.append(value)
+                    
+            for level in [0, 0.236, 0.382, 0.5, 0.618, 0.786]:
+                value = hourly_fib_levels[level]
+                if value >= lower_limit:
+                    support_levels.append(value)
+            
+            # Add 15min levels (lowest priority) with filtering
+            for level in fifteen_high.dropna().tolist():
+                if level <= upper_limit:
+                    resistance_levels.append(level)
+                    
+            for level in fifteen_low.dropna().tolist():
+                if level >= lower_limit:
+                    support_levels.append(level)
+            
+            # Add recent high/low if within range
+            if recent_high <= upper_limit:
+                resistance_levels.append(recent_high)
+            if recent_low >= lower_limit:
+                support_levels.append(recent_low)
 
             # Log all levels
-            logger.info(f"\nS/R Levels for {symbol}:")
+            logger.info(f"\nS/R Levels for {symbol} (Current Price: ${current_price:.4f}):")
+            logger.info(f"Filtering range: ${lower_limit:.4f} to ${upper_limit:.4f}")
+            
             logger.info("Daily Fibonacci Levels:")
-            for k, v in daily_fib_levels.items():
-                logger.info(f"- {k}: ${v:.4f}")
-                
-            logger.info(f"\n5min Fib Extensions: {[round(short_term_fib_levels[level], 4) for level in [1.414, 1.618, 2.618, 3.618, 4.236]]}")
-            logger.info(f"5min Fib Retracements: {[round(short_term_fib_levels[level], 4) for level in [0.236, 0.382, 0.5, 0.618, 0.786]]}")
+            logger.info("Support Levels:")
+            for k in [-1, 0, 0.236, 0.382, 0.5, 0.618, 0.786]:
+                value = daily_fib_levels[k]
+                included = "✓" if lower_limit <= value <= upper_limit else "✗"
+                logger.info(f"- {k}: ${value:.4f} {included}")
+            
+            logger.info("Resistance Levels:")
+            for k in [1, 1.414, 1.618, 2.618, 3.618, 4.236]:
+                value = daily_fib_levels[k]
+                included = "✓" if lower_limit <= value <= upper_limit else "✗"
+                logger.info(f"- {k}: ${value:.4f} {included}")
+                    
+            logger.info(f"\nHourly Fib Extensions: {[round(hourly_fib_levels[level], 4) for level in [1.414, 1.618, 2.618, 3.618, 4.236]]}")
+            logger.info(f"Hourly Fib Retracements: {[round(hourly_fib_levels[level], 4) for level in [0, 0.236, 0.382, 0.5, 0.618, 0.786]]}")
             logger.info(f"Recent High/Low: {round(recent_high, 4)}/{round(recent_low, 4)}")
             
             # Improved deduplication with tolerance
@@ -887,6 +922,13 @@ class KrakenAdvancedGridStrategy:
             # Deduplicate before returning
             support_levels = deduplicate_levels(support_levels)
             resistance_levels = deduplicate_levels(resistance_levels)
+            
+            # Final filtering - only include levels within reasonable range of current price
+            support_levels = [level for level in support_levels if level >= lower_limit]
+            resistance_levels = [level for level in resistance_levels if level <= upper_limit]
+            
+            logger.info(f"\nFinal Support Levels: {[round(level, 4) for level in support_levels]}")
+            logger.info(f"Final Resistance Levels: {[round(level, 4) for level in resistance_levels]}")
             
             return support_levels, resistance_levels
                 
@@ -917,22 +959,28 @@ class KrakenAdvancedGridStrategy:
             return 0.0001, 0.0001  # Default fallback rates
 
     async def get_exchange_fees(self, symbol: str) -> Tuple[float, float]:
-        """Get current maker/taker fees for Kraken spot"""
+        """Get current maker/taker fees from Kraken Spot"""
         try:
-            # Use Kraken's standard spot fee tiers
-            # https://www.kraken.com/features/fee-schedule
-            maker_fee = 0.0016  # 0.16% maker fee
-            taker_fee = 0.0026  # 0.26% taker fee
+            # Use CCXT's built-in fee fetching for spot
+            fees = await self.exchange.fetch_trading_fees()
             
-            logger.info(f"\nSpot Trading Fees:")
-            logger.info(f"Maker Fee: {maker_fee:.4%}")
-            logger.info(f"Taker Fee: {taker_fee:.4%}")
-            
-            return maker_fee, taker_fee
+            if fees and 'maker' in fees and 'taker' in fees:
+                maker_fee = fees['maker']
+                taker_fee = fees['taker']
+                
+                logger.info(f"\nSpot Trading Fees:")
+                logger.info(f"Maker Fee: {maker_fee:.4%}")
+                logger.info(f"Taker Fee: {taker_fee:.4%}")
+                
+                return maker_fee, taker_fee
+                
+            logger.warning("Could not fetch spot trading fees")
             
         except Exception as e:
-            logger.error(f"Error getting fees: {e}")
-            return 0.0026, 0.0026  # Conservative default
+            logger.error(f"Error fetching Kraken Spot fees: {e}")
+        
+        # Default conservative spot fees
+        return 0.0026, 0.0040  # 0.26% default Kraken spot fees
 
     async def calculate_total_fees(self, price: float, size: float, symbol: str) -> float:
         """Calculate total round-trip fees including entry, exit, and funding"""
@@ -963,52 +1011,38 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error calculating fees: {e}")
             return 0.0
 
-    async def validate_trade_profitability(self, price: float, size: float, symbol: str) -> bool:
+    def validate_trade_profitability(self, price: float, size: float, symbol: str) -> bool:
         """Validate if trade is profitable after fees with dynamic thresholds"""
         try:
-            # First validate minimum size
-            if size < 0.00001:  # Kraken's minimum precision
-                logger.warning(f"Size {size} is below minimum precision of 0.00001")
-                return False
+            # Calculate total fees
+            total_fees = self.calculate_total_fees(price, size, symbol)
             
-            # Calculate total fees using the dedicated fee calculation method
-            total_fees = await self.calculate_total_fees(price, size, symbol)  # Added await here
-            
-            # Determine price-based profit multiplier
-            price_ranges = [
-                (20000, 2.0),   # BTC range
-                (1000, 1.8),    # ETH range
-                (100, 1.6),     # High-value alts
-                (10, 1.4),      # Mid-value alts
-                (1, 1.2),       # Low-value alts
-                (0, 1.1)        # Micro-price alts
-            ]
-            
-            min_profit_multiplier = next(
-                (multiplier for threshold, multiplier in price_ranges if price >= threshold),
-                1.1
-            )
+            # Get price-appropriate minimum profit threshold
+            if price >= 20000:
+                min_profit_multiplier = 2.0  # Higher threshold for BTC
+            elif price >= 1000:
+                min_profit_multiplier = 1.8  # ETH range
+            elif price >= 100:
+                min_profit_multiplier = 1.6  # High-value alts
+            elif price >= 10:
+                min_profit_multiplier = 1.4  # Mid-value alts
+            elif price >= 1:
+                min_profit_multiplier = 1.2  # Low-value alts
+            else:
+                min_profit_multiplier = 1.1  # Micro-price alts
+                
+            # Calculate minimum profit needed with dynamic threshold
+            min_profit_needed = total_fees * min_profit_multiplier
             
             # Calculate grid profit
-            grid_profit = abs(price * size * self.grid_spacing)
+            grid_profit = price * size * self.grid_spacing
             
-            # Calculate minimum required profit
-            min_profit_relative = total_fees * min_profit_multiplier
-            min_profit_absolute = max(
-                price * size * 0.001,  # 0.1% of position value
-                0.25                   # Minimum $0.25
-            )
-            min_profit_needed = max(min_profit_relative, min_profit_absolute)
-            
-            # Validate profitability
+            # Check if grid profit covers fees with appropriate buffer
             is_profitable = grid_profit > min_profit_needed
             
-            # Log detailed profitability analysis
-            logger.info(f"\nProfitability Analysis for {symbol}:")
-            logger.info(f"Price: ${price:.4f}")
-            logger.info(f"Size: {size:.6f}")  # Increased precision in logging
+            logger.info(f"\nProfitability Check for {symbol}:")
+            logger.info(f"Price Range: ${price:.4f}")
             logger.info(f"Grid Profit: ${grid_profit:.4f}")
-            logger.info(f"Total Fees: ${total_fees:.4f}")
             logger.info(f"Min Profit Needed: ${min_profit_needed:.4f}")
             logger.info(f"Profit Multiplier: {min_profit_multiplier}x")
             logger.info(f"Profitable: {'✅' if is_profitable else '❌'}")
@@ -1018,9 +1052,9 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.error(f"Error validating profitability: {e}")
             return False
-        
+
     async def execute_grid_orders(self, symbol: str, force_create: bool = False) -> None:
-        """Execute grid orders with fee validation, ensuring orders are only placed near S/R levels"""
+        """Execute grid orders with fee validation"""
         try:
             logger.info(f"\n{'='*50}")
             logger.info(f"🔄 STARTING GRID EXECUTION FOR {symbol}")
@@ -1031,22 +1065,7 @@ class KrakenAdvancedGridStrategy:
                 logger.warning(f"❌ No historical data for {symbol}")
                 return
 
-            # Calculate volatility with fallback default
-            try:
-                volatility = await self.calculate_volatility(df)
-                if volatility is None:
-                    volatility = 2.0  # Default moderate volatility
-                    logger.warning(f"Using default volatility of {volatility}%")
-            except Exception as e:
-                volatility = 2.0
-                logger.error(f"Error calculating volatility: {e}")
-
-            current_price = float(df['close'].iloc[-1])
-            
-            # Adjust grid parameters as needed
-            await self.adjust_grid_parameters(volatility, current_price, symbol)
-
-            # Check if we are in a spot position by fetching balance
+            # First verify if this is a spot position
             try:
                 balance = await self.exchange.fetch_balance()
                 asset = symbol.split('/')[0]
@@ -1057,15 +1076,10 @@ class KrakenAdvancedGridStrategy:
                 logger.error(f"Error checking spot balance: {e}")
                 is_spot = False
 
-            # If we already have an active position, manage stop loss instead of creating new orders
-            if symbol in self.active_positions:
-                position = self.active_positions[symbol]
-                current_price = await self.get_current_price(symbol)
-                await self.manage_stop_loss(symbol, position, current_price)
-                return
-
-            # Multi-timeframe trend analysis
+             # Get multi-timeframe trend analysis
             trend_data = await self.analyze_multi_timeframe_trend(symbol)
+            
+            # Log trend analysis
             logger.info(f"\nMulti-Timeframe Analysis for {symbol}:")
             for timeframe, data in trend_data.items():
                 logger.info(f"{timeframe}: {data['trend'].upper()} (Strength: {data['strength']:.2f}%)")
@@ -1073,36 +1087,36 @@ class KrakenAdvancedGridStrategy:
                 logger.info(f"Near Support: {'✅' if data['near_support'] else '❌'}")
                 logger.info(f"Near Resistance: {'✅' if data['near_resistance'] else '❌'}")
 
-            # Adjust grid levels based on technical conditions (for spot, adjust buy order grids)
+            # Adjust grid levels based on technical analysis
             if is_spot:
-                if trend_data['1h']['is_oversold'] and trend_data['1h']['near_support'] and trend_data['1h']['rsi'] > 45:
+                # Add more buy grids if oversold in higher timeframes
+                if trend_data['1h']['is_oversold'] and trend_data['1h']['near_support']:
                     self.grid_levels += 1
                     logger.info("✅ Adding extra buy grid - Oversold conditions")
+                
+                # Reduce grids if overbought
                 if trend_data['1h']['is_overbought'] and trend_data['1h']['near_resistance']:
                     self.grid_levels = max(1, self.grid_levels - 1)
                     logger.info("⚠️ Reducing grid levels - Overbought conditions")
 
-            # Market analysis before order creation
+            # Market Analysis - Do this BEFORE checking existing orders
             logger.info(f"\n{'='*30}")
             logger.info(f"🔍 ANALYZING MARKET CONDITIONS FOR {symbol}")
             logger.info(f"{'='*30}")
  
             should_trade, volatility = await self.analyze_market_conditions(df, symbol)
             logger.info(f"Market conditions check - Should trade: {'✅' if should_trade else '❌'}, Volatility: {volatility:.2f}%")
+            
             if not should_trade:
                 logger.info(f"❌ Market conditions not favorable for {symbol}, skipping")
                 return
-
-            five_min_df = await self.get_historical_data(symbol, '5m', 50)
-            if not await self._analyze_5m(five_min_df, symbol):
-                logger.info("❌ 5min conditions not met")
-                return
                 
-            # Adjust grid parameters again based on latest data
-            await self.adjust_grid_parameters(volatility, float(df['close'].iloc[-1]), symbol)
+            # Adjust grid parameters based on volatility
+            self.adjust_grid_parameters(volatility, float(df['close'].iloc[-1]))
             logger.info(f"Grid parameters adjusted for volatility: {volatility:.2f}%")
 
             logger.info(f"🔍 Checking existing orders for {symbol}")
+            # Now check existing orders
             if not force_create:
                 has_existing_orders = await self.check_existing_orders(symbol)
                 logger.info(f"Existing orders check: {'✅' if has_existing_orders else '❌'}")
@@ -1110,13 +1124,14 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Valid existing orders for {symbol}, skipping")
                     return
 
+            # Get current price and validate
             current_price = await self.get_current_price(symbol)
             if not current_price:
                 logger.warning(f"❌ Could not get current price for {symbol}")
                 return
             logger.info(f"Current price for {symbol}: ${current_price:.4f}")
 
-            # Calculate Support/Resistance levels
+            # Calculate S/R levels
             logger.info(f"📊 Calculating support/resistance levels")
             support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
 
@@ -1129,32 +1144,36 @@ class KrakenAdvancedGridStrategy:
 
             logger.info(f"✅ Generated {len(grid_prices)} grid prices")
             
-            # Normalize grid prices and their confidence levels
+            # Convert numpy float64 to regular float and ensure proper format
             normalized_prices = []
             for price in grid_prices:
                 if isinstance(price, (tuple, list)):
                     price_val, confidence = price
                     normalized_prices.append((float(price_val), float(confidence)))
                 elif isinstance(price, (float, np.float64)):
+                    # Handle case where price is a single value
                     normalized_prices.append((float(price), 1.0))
                 else:
                     logger.warning(f"Skipping invalid price format: {price}")
                     continue
 
+            # Normalize and validate grid prices in one pass
             max_confidence = max((conf for _, conf in normalized_prices), default=0)
+
+            # Initialize valid grids list and confidence map
             valid_grids = []
-            grid_confidence = {}
+            grid_confidence = {}  # Store confidence values separately
             previous_price = None
 
             # Calculate price change and volume confirmation
             price_change = (df['close'].iloc[-1] - df['close'].iloc[-20]) / df['close'].iloc[-20]
             recent_volume = df['volume'].tail(20).mean()
             current_volume = df['volume'].iloc[-1]
-            volume_confirmed = current_volume > recent_volume * 0.1  # Reduced to 10%
+            volume_confirmed = current_volume > recent_volume * 0.1  # Reduce to 10%
 
-            # Evaluate candidate grid prices for S/R alignment and technical signals
+            # Handle single float values in grid_prices
             for price_item in grid_prices:
-                # Normalize price and determine confidence
+                # Convert price to float and assign default confidence
                 if isinstance(price_item, (np.float64, float)):
                     price_obj = float(price_item)
                     raw_confidence = 1.0
@@ -1162,58 +1181,40 @@ class KrakenAdvancedGridStrategy:
                     price_obj, raw_confidence = price_item
                     price_obj = float(price_obj)
                 
+                # Normalize confidence
                 if max_confidence > 0:
-                    normalized_confidence = (raw_confidence / max_confidence) * 100  # Scale to 0-100
-                    if normalized_confidence < 70:  # Filter out low-confidence levels
+                    normalized_confidence = (raw_confidence / max_confidence) * 100  # Scale to 0-100 instead of 0-10
+                    if normalized_confidence < 70:  # Require 70% of max confidence
                         logger.info(f"Skipping price {price_obj} - confidence too low: {normalized_confidence:.2f}")
                         continue
                 else:
                     normalized_confidence = 0
                 
-                # Ensure grid prices are not too close to each other
+                # Define minimum distance between grids
                 min_distance = current_price * 0.02
+
+                # Check minimum distance from previous grid
                 if previous_price and abs(price_obj - previous_price) < min_distance:
                     logger.info(f"Skipping price {price_obj} - too close to previous grid at {previous_price}")
                     continue
                 
-                # S/R alignment checks
+                # Check S/R alignment
                 is_near_support = any(abs(price_obj - s) / s <= 0.01 for s in support_levels)
                 is_near_resistance = any(abs(price_obj - r) / r <= 0.01 for r in resistance_levels)
+                
+                # Calculate price change and momentum
                 would_be_side = "buy" if price_obj < current_price else "sell"
-                momentum_aligned = ((price_change > 0 and price_obj > current_price) or
-                                    (price_change < 0 and price_obj < current_price))
-                
-                # For spot mode, omit sell side grid generation entirely
-                if is_spot and would_be_side == "sell":
-                    logger.info(f"❌ Skipping sell grid creation for spot positions at {price_obj}")
-                    continue
+                momentum_aligned = (price_change > 0 and price_obj > current_price) or \
+                                 (price_change < 0 and price_obj < current_price)
 
-                # For buys, require alignment with support (and not too close to resistance)
-                # For sells, require alignment with resistance (and not too near support)
-                if would_be_side == "buy":
-                    valid_sr = is_near_support and (not is_near_resistance)
-                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] < 40
-                else:
-                    valid_sr = is_near_resistance and (not is_near_support)
-                    valid_rsi = talib.RSI(df['close'], 14).iloc[-1] > 60
-
-                # Check additional technical indicators
-                macd_line, signal_line, histogram = talib.MACD(
-                    df['close'], 
-                    fastperiod=self.macd_fast,
-                    slowperiod=self.macd_slow,
-                    signalperiod=self.macd_signal
-                )
-                macd_bullish = (
-                    (macd_line.iloc[-1] > signal_line.iloc[-1]) or  # Changed to OR
-                    (histogram.iloc[-1] > histogram.iloc[-2])
-                )
-                
+                # Adjust validation requirements
                 valid_for_trade = (
-                    (momentum_aligned or volume_confirmed) and
-                    valid_sr and
-                    (valid_rsi or macd_bullish) and  # OR instead of AND
-                    normalized_confidence > 70  
+                    (momentum_aligned or volume_confirmed) or  # Need either momentum OR volume
+                    (
+                        (would_be_side == "buy" and is_near_support) or
+                        (would_be_side == "sell" and is_near_resistance) or
+                        normalized_confidence > 8  
+                    )
                 )
                 
                 if valid_for_trade:
@@ -1226,7 +1227,7 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"\n❌ Rejected {price_obj} due to:")
                     logger.info(f"Volume confirmed: {volume_confirmed}")
                     logger.info(f"Momentum aligned: {momentum_aligned}")
-                    logger.info(f"Intended side: {would_be_side}")
+                    logger.info(f"Side: {would_be_side}")
                     logger.info(f"Near support: {is_near_support}")
                     logger.info(f"Near resistance: {is_near_resistance}")
 
@@ -1236,62 +1237,44 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"{'='*30}")
 
             orders_placed = 0
+            min_buffer = current_price * 0.005
 
             for price in valid_grids:
                 side = "buy" if price < current_price else "sell"
                 
-                # For spot positions, omit sell orders; the monitor_stop_loss method handles sells.
+                # Skip sell orders for spot positions
                 if is_spot and side == "sell":
-                    logger.info(f"❌ Skipping sell order for spot position at ${price:.4f} (handled by stop loss monitoring)")
-                    continue
-
-                # Get relevant S/R levels based on order side
-                if side == "buy":
-                    relevant_levels = support_levels
-                    level_type = "support"
-                    max_distance = 0.01  # 1% tolerance
-                else:
-                    relevant_levels = resistance_levels 
-                    level_type = "resistance"
-                    max_distance = 0.008  # 0.8% tolerance
-
-                # Check that the grid price is within the acceptable buffer of a key level
-                near_level = any(abs(price - level) / level < max_distance for level in relevant_levels[:3])
-                if not near_level:
-                    logger.info(f"Skipping {side} order at {price} - not near {level_type}")
+                    logger.info(f"❌ Skipping sell order at ${price:.4f} - Spot position")
                     continue
                 
                 logger.info(f"\nValidating {side.upper()} order at ${price:.4f}")
-
-                # Determine order size
+                
+                if abs(price - current_price) < min_buffer:
+                    logger.info(f"❌ Skipping - too close to current price (buffer: ${min_buffer:.4f})")
+                    continue
+                    
+                # Get initial size
                 size = await self.calculate_position_size(price, symbol)
                 logger.info(f"Initial calculated position size: {size}")
+                
+                # Add size validation before fee check
                 size = await self.validate_grid_order_size(symbol, size)
                 logger.info(f"Validated position size: {size}")
-
-                # For spot buys, check USD balance
-                if is_spot and side == "buy":
-                    try:
-                        usd_balance = (await self.exchange.fetch_balance())['USD']['free']
-                        order_cost = price * size
-                        if order_cost > usd_balance:
-                            logger.warning(f"❌ Insufficient USD balance: {usd_balance:.2f} < {order_cost:.2f}")
-                            continue
-                    except Exception as e:
-                        logger.error(f"Balance check error: {e}")
-                        continue
                 
-                # Validate profitability
-                if not await self.validate_trade_profitability(price, size, symbol):
+                # Add fee validation
+                if not self.validate_trade_profitability(price, size, symbol):
                     logger.info(f"❌ Skipping - not profitable after fees")
                     continue
                 
                 try:
+                    # Modify the order parameters to use Kraken's specific flags
                     order_params = {
                         'trading_agreement': 'agree',
-                        'oflags': 'post'
+                        'oflags': 'post'  # This is Kraken's way of setting post-only orders
                     }
-                    logger.info("Attempting to place order with params:")
+                    
+                    # Log the exact order parameters
+                    logger.info(f"Attempting to place order with params:")
                     logger.info(f"Symbol: {symbol}")
                     logger.info(f"Type: limit")
                     logger.info(f"Side: {side}")
@@ -1299,16 +1282,6 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Price: {price}")
                     logger.info(f"Params: {order_params}")
                     
-                    # Validate size first
-                    if size < 0.00001:  # Kraken's minimum precision
-                        logger.warning(f"❌ Size {size} is below minimum precision of 0.00001")
-                        continue
-
-                    # Validate profitability - Add await here
-                    if not await self.validate_trade_profitability(price, size, symbol):
-                        logger.info(f"❌ Skipping - not profitable after fees")
-                        continue
-
                     order = await self.exchange.create_order(
                         symbol=symbol,
                         type='limit',
@@ -1331,8 +1304,7 @@ class KrakenAdvancedGridStrategy:
                         logger.info(f"✅ Successfully placed {side} order at {price} for {size} {symbol}")
                         logger.info(f"Order ID: {order['id']}")
                     
-                    await self.refresh_grid_levels(symbol)
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)  # Rate limiting between orders
                     
                 except Exception as e:
                     logger.error(f"Order placement failed for {symbol} at {price}: {str(e)}")
@@ -1345,20 +1317,59 @@ class KrakenAdvancedGridStrategy:
                 
         except Exception as e:
             logger.error(f"❌ Error executing grid orders: {e}")
-            traceback.print_exc()
 
     async def get_current_price(self, symbol: str) -> float:
-        """Get current price using last trade price with bid/ask spread awareness"""
+        """Get current price with enhanced error handling and validation"""
         try:
-            ticker = await self.exchange.fetch_ticker(symbol)
-            # Use last price but verify against spread
-            spread = ticker['ask'] - ticker['bid']
-            if spread > ticker['last'] * 0.001:  # More than 0.1% spread
-                return (ticker['bid'] + ticker['ask']) / 2  # Use mid price
-            return ticker['last']
+            # Check cache first with strict timeout
+            cached_price = self.current_prices.get(symbol)
+            cache_time = self.price_update_times.get(symbol, 0)
+            if cached_price and time.time() - cache_time < 15:  # 15-second cache
+                return cached_price
+
+            # Fetch new price with retry and longer delay
+            for attempt in range(3):
+                try:
+                    # Add delay between retries
+                    if attempt > 0:
+                        await asyncio.sleep(1)
+                        
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    if not ticker:
+                        logger.warning(f"No ticker data received for {symbol}")
+                        continue
+                    
+                    # Try last price first
+                    price = ticker.get('last')
+                    if price is not None:
+                        price = float(price)
+                        if price > 0:
+                            self.current_prices[symbol] = price
+                            self.price_update_times[symbol] = time.time()
+                            return price
+                    
+                    # Fall back to bid/ask average
+                    bid = ticker.get('bid')
+                    ask = ticker.get('ask')
+                    if bid is not None and ask is not None:
+                        price = (float(bid) + float(ask)) / 2
+                        if price > 0:
+                            self.current_prices[symbol] = price
+                            self.price_update_times[symbol] = time.time()
+                            return price
+                        
+                    logger.warning(f"No valid price found in ticker for {symbol}")
+                        
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1} failed for {symbol}: {str(e)}")
+                
+            # If we get here, we failed to get a valid price
+            logger.error(f"Failed to get valid price for {symbol} after all attempts")
+            return None
+                
         except Exception as e:
-            logger.error(f"Error getting price for {symbol}: {e}")
-            return 0.0
+            logger.error(f"Error in get_current_price for {symbol}: {e}")
+            return None
 
     async def calculate_grid_levels(self, current_price: float, symbol: str = None) -> List[float]:
         """Calculate grid price levels with dynamic precision and position sizing"""
@@ -1460,96 +1471,164 @@ class KrakenAdvancedGridStrategy:
             logger.error(f"Error calculating grid levels: {e}")
             return []
 
-    async def calculate_position_size(self, current_price: float, symbol: str) -> float:
-        """Safe position sizing with USD balance check for spot buys"""
+    async def calculate_position_size(self, price: float, symbol: str = None) -> float:
+        """Calculate position size with dynamic account scaling and volatility"""
         try:
-            # Split symbol into base/quote currencies (e.g. POPCAT/USD)
-            base_currency, quote_currency = symbol.split('/')
-            
-            market = self.exchange.market(symbol)
-            min_size = float(market['limits']['amount']['min'])
-            precision = int(market['precision']['amount'])
-            
-            # Get balances
-            balance = await self.exchange.fetch_balance()
-            portfolio_value = float(balance['total']['USD'])
-            
-            # Check minimum required capital in USD
-            min_usd_required = min_size * current_price
-            if portfolio_value < min_usd_required:
-                logger.warning(f"❌ Insufficient USD capital for {symbol}")
-                logger.warning(f"Need ${min_usd_required:.2f}, have ${portfolio_value:.2f}")
-                return 0.0
-                
-            # Calculate max USD to risk
-            risk_usd = min(
-                portfolio_value * self.risk_per_trade,
-                float(balance.get(quote_currency, {}).get('free', 0))  # Available USD
-            )
-            
-            # Convert USD risk to base currency size
-            size = risk_usd / current_price
-            
-            # Enforce minimum size after USD conversion
-            if size < min_size:
-                logger.warning(f"⚠️ Increasing size to meet {symbol} minimum {min_size}")
-                adjusted_size = min_size * 1.01  # Add 1% buffer
-                
-                # Validate adjusted USD risk
-                adjusted_usd_risk = adjusted_size * current_price
-                if adjusted_usd_risk > (portfolio_value * self.max_risk_per_trade):
-                    logger.warning(f"❌ Minimum size exceeds max USD risk (${adjusted_usd_risk:.2f})")
-                    return 0.0
+            account_value = self.last_balance
+            logger.info(f"\n{'='*50}")
+            logger.info(f"📊 POSITION SIZING FOR {symbol}")
+            logger.info(f"Account Value: ${account_value:.2f}")
+            logger.info(f"Current Price: ${price:.2f}")
+
+            # Initialize volatility
+            volatility = 1.0  # Default value
+            try:
+                volatility = await self.get_asset_volatility(symbol)
+            except Exception as e:
+                logger.warning(f"Using default volatility: {e}")
+
+            # Dynamic allocation based on account size AND number of grid levels
+            grid_levels = 4  # Typical number of grid levels
+            allocation_scale = {
+                (0, 50): 0.25/grid_levels,    # 25% total for micro accounts (<$50)
+                (50, 100): 0.20/grid_levels,  # 20% total for very small accounts
+                (100, 500): 0.15/grid_levels, # 15% total for small accounts
+                (500, 1000): 0.12/grid_levels,# 12% total for medium accounts
+                (1000, float('inf')): 0.10/grid_levels  # 10% total for larger accounts
+            }
+
+            # Find appropriate allocation percentage
+            allocation_percent = 0.05  # Default to 5%
+            for (min_val, max_val), alloc in allocation_scale.items():
+                if min_val <= account_value < max_val:
+                    allocation_percent = alloc
+                    break
+
+            # Get Kraken's minimum requirements
+            try:
+                markets = await self.exchange.fetch_markets()
+                market_info = next((m for m in markets if m['symbol'] == symbol), None)
+                if market_info:
+                    min_amount = float(market_info.get('limits', {}).get('amount', {}).get('min', 0))
+                    min_cost = float(market_info.get('limits', {}).get('cost', {}).get('min', 0))
                     
-                size = adjusted_size
+                    logger.info(f"Exchange Minimums:")
+                    logger.info(f"Min Amount: {min_amount}")
+                    logger.info(f"Min Cost: ${min_cost}")
+                else:
+                    raise Exception(f"Market info not found for {symbol}")
+                    
+            except Exception as e:
+                logger.warning(f"Could not fetch market limits: {e}")
+                # Strict fallback minimums based on logs
+                min_requirements = {
+                    'XRP/USD': 2.0,    # From logs: Min Amount: 2.0
+                    'SPX/USD': 3.5,    # From logs: Min Amount: 3.5
+                    'USDT/USD': 5.0,   # From logs: Min Amount: 5.0
+                    'SOL/USD': 0.1,    # Conservative estimate
+                    'BTC/USD': 0.0001, # Standard BTC minimum
+                    'ETH/USD': 0.01,   # Standard ETH minimum
+                    'default': 5.0     # Safe default
+                }
+                min_amount = min_requirements.get(symbol, min_requirements['default'])
+                min_cost = min_amount * price
+
+            # Calculate initial allocation (40% for small accounts)
+            initial_allocation = account_value * allocation_percent
+            position_size = initial_allocation / price
+
+            # CRITICAL: Ensure we meet minimum size requirements
+            position_size = max(position_size, min_amount)
             
-            # Convert to proper precision
-            size = round(float(size), precision)
+            logger.info(f"Base size before minimums: {position_size:.4f}")
+            logger.info(f"Required minimum: {min_amount:.4f}")
+
+            # Apply volatility scaling if we're above minimums
+            if position_size > min_amount:
+                try:
+                    vol_scale = {
+                        (0, 1): 1.0,      # Very low vol: normal size
+                        (1, 2): 0.9,      # Low vol: slightly reduced
+                        (2, 3): 0.8,      # Moderate vol: reduced
+                        (3, 5): 0.7,      # High vol: significantly reduced
+                        (5, 8): 0.6,      # Very high vol: minimum size
+                        (8, float('inf')): 0.4  # Extreme vol: ultra conservative
+                    }
+                    
+                    vol_factor = 0.4  # Default to most conservative
+                    for (vol_min, vol_max), scale in vol_scale.items():
+                        if vol_min <= volatility < vol_max:
+                            vol_factor = scale
+                            break
+                    
+                    position_size *= vol_factor
+                    position_size = max(position_size, min_amount)  # Ensure we still meet minimums
+                    logger.info(f"Volatility: {volatility:.2f}% (Scale: {vol_factor}x)")
+                    
+                except Exception as e:
+                    logger.warning(f"Using default volatility scaling: {e}")
+
+            # Calculate base position size
+            position_size = initial_allocation / price
             
-            # Spot balance check - FIXED VERSION
-            if self.is_spot:
-                # For BUY orders: check QUOTE currency balance (USD)
-                # For SELL orders: check BASE currency balance (POPCAT)
-                _, quote_currency = symbol.split('/')
-                available_quote = float(balance.get(quote_currency, {}).get('free', 0))
-                
-                # Calculate maximum buyable with available USD
-                max_buyable = available_quote / current_price
-                if size > max_buyable:
-                    logger.warning(f"⚠️ Adjusting size to available USD balance: ${available_quote:.2f}")
-                    size = max_buyable
-                
-                # Now check if this adjusted size meets minimums
-                if size < min_size:
-                    logger.error(f"❌ USD balance too low for minimum {symbol} order")
-                    return 0.0
+            # Ensure we meet exchange minimums
+            min_required = max(
+                min_amount,
+                min_cost / price if min_cost else 0
+            )
+            position_size = max(position_size, min_required)
+            
+            logger.info(f"Base size: {position_size:.4f}")
+            logger.info(f"Min required: {min_required:.4f}")
+
+            # Keep your existing entry scaling logic
+            if not hasattr(self, 'entry_counts'):
+                self.entry_counts = {}
+            entry_count = self.entry_counts.get(symbol, 0) + 1
+            self.entry_counts[symbol] = entry_count
+
+            # Enhanced scaling based on volatility
+            if entry_count <= 3:
+                if volatility <= 3:
+                    base_scale = {1: 1.0, 2: 1.5, 3: 2.0}.get(entry_count, 1.0)
+                elif volatility <= 5:
+                    base_scale = {1: 1.0, 2: 1.3, 3: 1.6}.get(entry_count, 1.0)
+                else:
+                    base_scale = {1: 1.0, 2: 1.2, 3: 1.4}.get(entry_count, 1.0)
+            
+                position_size *= base_scale
+                logger.info(f"Entry scaling: {base_scale}x (Entry #{entry_count})")
+
+            # Final rounding based on price range
+            if price >= 20000:  # BTC
+                position_size = round(position_size, 3)
+            elif price >= 1000:  # ETH
+                position_size = round(position_size, 2)
+            else:
+                position_size = round(position_size, 1)
 
             # Final validation
-            final_usd_cost = size * current_price
-            available_usd = float(balance.get(quote_currency, {}).get('free', 0))
-            if final_usd_cost > available_usd:
-                logger.warning(f"⚠️ Adjusting size to available USD balance: ${available_usd:.2f}")
-                size = available_usd / current_price
-                
-            if size < min_size:
-                logger.error(f"❌ Final size {size:.4f} {base_currency} still below minimum")
-                return 0.0
-                
-            logger.info(f"✅ Valid buy size: {size:.4f} {base_currency} (${final_usd_cost:.2f} USD)")
-            return round(size, precision)
-            
+            position_value = position_size * price
+            if position_value > account_value * 0.40:  # Cap at 40% of account
+                position_size = (account_value * 0.40) / price
+                position_size = max(position_size, min_amount)  # Still ensure minimum
+                logger.warning("Position size reduced to stay within 40% account limit")
+
+            logger.info(f"\nFinal Position Details:")
+            logger.info(f"Size: {position_size:.4f}")
+            logger.info(f"Value: ${position_size * price:.2f}")
+            logger.info(f"Account %: {(position_size * price / account_value)*100:.1f}%")
+            logger.info(f"{'='*50}\n")
+
+            return position_size
+
         except Exception as e:
-            logger.error(f"❌ Position size error: {e}")
+            logger.error(f"Error calculating position size: {e}")
             return 0.0
 
     async def manage_stop_loss(self, symbol: str, position: Dict, current_price: float) -> None:
         """Manage stop loss and take profits for both spot and margin positions"""
         try:
-            # Add this debug log at start
-            logger.info(f"🏁 STARTING STOP LOSS MANAGEMENT FOR {symbol}")
-            logger.debug(f"Position data: {position}")
-            logger.debug(f"Current price: {current_price}")
-
             # Get position details
             entry_price = float(position['info']['price'])
             position_side = position['info'].get('side', 'long')  # Default to 'long' for spot
@@ -1596,10 +1675,8 @@ class KrakenAdvancedGridStrategy:
                         'trailing_active': False,
                         'stop_buffer': 0.002,
                         'original_size': position_size,
-                        'current_position_size': position_size,  # Add this to track remaining size
                         'entry_price': entry_price,
                         'is_spot': is_spot,
-                        'position_side': position_side,  # Add this to track position side
                         'spot_balance': max(spot_balance, total_balance)
                     }
                     
@@ -1615,7 +1692,6 @@ class KrakenAdvancedGridStrategy:
             position_data = self.positions[symbol]
             entry_price = position_data['entry_price']  # Changed from initial_entry_price to match
             is_spot = position_data.get('is_spot', False)
-            position_side = position_data.get('position_side', 'long')  # Get from position data
             
             # Get mark price with validation
             try:
@@ -1677,8 +1753,8 @@ class KrakenAdvancedGridStrategy:
 
             # Get most recent entry price from order history
             try:
-                orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
-                recent_buys = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
+                orders = await self.exchange.fetch_open_orders(symbol, limit=5)
+                recent_buys = [o for o in orders if o['side'] == 'buy' and o['status'] == 'open']
                 if recent_buys:
                     entry_price = float(recent_buys[0]['price'])
                     logger.info(f"Using most recent entry price: ${entry_price}")
@@ -1700,7 +1776,7 @@ class KrakenAdvancedGridStrategy:
                         logger.info("Confirming actual loss before stop")
                         await self.execute_stop_loss(
                             symbol=symbol,
-                            position_size=position_data['current_position_size'],  # Use tracked size
+                            position_size=position_size,
                             is_spot=is_spot,
                             reason="stop loss"
                         )
@@ -1902,8 +1978,7 @@ class KrakenAdvancedGridStrategy:
             logger.info(f"Trailing: {'✅' if position_data.get('trailing_active') else '⏳'}")
 
         except Exception as e:
-            logger.error(f"Critical error in stop management: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error in manage_stop_loss for {symbol}: {e}")
 
     async def execute_take_profit(self, symbol: str, position_side: str, size: float, price: float, tp_type: str, is_spot: bool = False) -> bool:
         """Execute a take profit order with retries and confirmation"""
@@ -1942,13 +2017,69 @@ class KrakenAdvancedGridStrategy:
                         min_volume = min_volumes.get(asset, min_volumes['default'])
                         logger.info(f"Minimum volume requirement for {asset}: {min_volume}")
                         
-                        # Try partial TP first
-                        if tp_type == 'TP1':
-                            size = spot_balance * 0.3
-                        elif tp_type == 'TP2':
-                            size = spot_balance * 0.3
-                        else:
-                            size = spot_balance
+                        # Get position history to implement FIFO
+                        try:
+                            # Fetch recent orders to identify entry points
+                            orders = await self.exchange.fetch_closed_orders(symbol, limit=10)
+                            buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
+                            
+                            # Sort buy orders by timestamp (oldest first for FIFO)
+                            buy_orders.sort(key=lambda x: x['timestamp'])
+                            
+                            logger.info(f"Found {len(buy_orders)} buy orders for FIFO analysis")
+                            
+                            # Calculate appropriate size based on FIFO
+                            if tp_type == 'TP1':
+                                # For TP1, sell 30% of the oldest position
+                                if buy_orders:
+                                    oldest_order = buy_orders[0]
+                                    oldest_filled = float(oldest_order['filled'])
+                                    oldest_price = float(oldest_order['price'])
+                                    
+                                    logger.info(f"FIFO: Oldest position from {datetime.fromtimestamp(oldest_order['timestamp']/1000)}")
+                                    logger.info(f"FIFO: Size {oldest_filled} @ ${oldest_price}")
+                                    
+                                    # Calculate 30% of the oldest position
+                                    size = min(oldest_filled * 0.3, spot_balance)
+                                    logger.info(f"FIFO: Taking 30% of oldest position: {size} {asset}")
+                                else:
+                                    # Fallback if no order history
+                                    size = spot_balance * 0.3
+                                    logger.info(f"No order history, using 30% of current balance: {size} {asset}")
+                            
+                            elif tp_type == 'TP2':
+                                # For TP2, sell another 30% of the oldest remaining position
+                                if len(buy_orders) >= 2:
+                                    # If we have multiple buy orders, take from the second oldest
+                                    second_oldest = buy_orders[1]
+                                    second_filled = float(second_oldest['filled'])
+                                    second_price = float(second_oldest['price'])
+                                    
+                                    logger.info(f"FIFO: Second position from {datetime.fromtimestamp(second_oldest['timestamp']/1000)}")
+                                    logger.info(f"FIFO: Size {second_filled} @ ${second_price}")
+                                    
+                                    # Calculate 30% of the second oldest position
+                                    size = min(second_filled * 0.3, spot_balance)
+                                    logger.info(f"FIFO: Taking 30% of second oldest position: {size} {asset}")
+                                else:
+                                    # If only one buy order, take another 30% from it
+                                    size = spot_balance * 0.3
+                                    logger.info(f"Only one position found, using 30% of current balance: {size} {asset}")
+                            
+                            else:  # Final TP or trailing stop
+                                # For final TP, sell remaining balance
+                                size = spot_balance
+                                logger.info(f"Final TP: Selling entire remaining balance: {size} {asset}")
+                        
+                        except Exception as e:
+                            logger.error(f"Error implementing FIFO for {symbol}: {e}")
+                            # Fallback to original percentage-based approach
+                            if tp_type == 'TP1':
+                                size = spot_balance * 0.3
+                            elif tp_type == 'TP2':
+                                size = spot_balance * 0.3
+                            else:
+                                size = spot_balance
                         
                         # Force market order for spot without reduceOnly
                         params = {
@@ -1957,14 +2088,41 @@ class KrakenAdvancedGridStrategy:
                         }
                         
                         try:
-                            # Try partial order first
+                            # Check if size meets minimum requirements
+                            if size < min_volume:
+                                logger.warning(f"❗ Size {size} is below minimum {min_volume} for {asset}")
+                                if spot_balance >= min_volume:
+                                    logger.info(f"Adjusting to minimum volume: {min_volume}")
+                                    size = min_volume
+                                else:
+                                    logger.info(f"Total balance {spot_balance} below minimum, selling entire position")
+                                    size = spot_balance
+                            
+                            # Execute the order
                             order = await self.exchange.create_market_order(
                                 symbol=symbol,
                                 side='sell',
                                 amount=size,
                                 params=params
                             )
-                            logger.info(f"Partial TP executed: {size} {asset}")
+                            logger.info(f"TP executed: {size} {asset}")
+                            
+                            # Update position tracking for FIFO
+                            if symbol in self.positions:
+                                # Record which TP was triggered
+                                if tp_type == 'TP1':
+                                    self.positions[symbol]['tp1_triggered'] = True
+                                    self.positions[symbol]['tp1_size'] = size
+                                    self.positions[symbol]['tp1_time'] = time.time()
+                                elif tp_type == 'TP2':
+                                    self.positions[symbol]['tp2_triggered'] = True
+                                    self.positions[symbol]['tp2_size'] = size
+                                    self.positions[symbol]['tp2_time'] = time.time()
+                                
+                                # Update remaining position size
+                                self.positions[symbol]['position_size'] -= size
+                                logger.info(f"Updated position tracking: {self.positions[symbol]['position_size']} {asset} remaining")
+                            
                             return True
                             
                         except Exception as e:
@@ -2023,93 +2181,183 @@ class KrakenAdvancedGridStrategy:
         return False
 
     async def monitor_positions(self, symbols: List[str] = None) -> None:
-        """Monitor positions with accurate price tracking and stop loss execution"""
+        """Monitor and manage open positions with batch processing"""
         try:
-            logger.info("\n=== MONITORING POSITIONS ===")
+            # If no symbols provided, check all active positions
+            if not symbols:
+                symbols = list(self.active_positions.keys())
             
-            # Get verified positions first
-            verified_positions = await self.verify_actual_positions()
+            # Create batches of 4 symbols with 8 max workers
+            batch_size = 4  # Balanced batch size
+            max_workers = 8  # More conservative worker count
             
-            # Monitor each verified position
-            for position in verified_positions:
-                symbol = position['symbol']
+            async def process_symbol(symbol: str):
                 try:
-                    # Get current price
-                    ticker = await self.exchange.fetch_ticker(symbol)
-                    current_price = float(ticker['last'])
+                    # Get mapped symbol from class attribute
+                    mapped_symbol = self.symbol_map.get(symbol)
+                    logger.info(f"Checking position for {symbol} (mapped: {mapped_symbol})")
                     
-                    # First manage stop loss levels
-                    await self.manage_stop_loss(
-                        symbol=symbol,
-                        position=position,
-                        current_price=current_price
-                    )
-                    
-                    logger.info(f"Monitored {symbol} at ${current_price}")
-                    
+                    # Check both mapped and original symbol
+                    position = None
+                    if mapped_symbol in self.active_positions:
+                        position = self.active_positions[mapped_symbol]
+                        logger.info(f"Found position using mapped symbol: {mapped_symbol}")
+                    elif symbol in self.active_positions:
+                        position = self.active_positions[symbol]
+                        mapped_symbol = symbol
+                        logger.info(f"Found position using original symbol: {symbol}")
+                        
+                    if position:
+                        logger.error(f"\n{'='*50}")
+                        logger.error(f"MONITORING POSITION - {symbol}")
+                        logger.error(f"Size: {position['info'].get('size', 0)}")
+                        logger.error(f"Entry: {position['info'].get('price', 'N/A')}")
+                        logger.error(f"Side: {position['info'].get('side', 'N/A')}")
+                        logger.error(f"{'='*50}\n")
+                        
+                        # Get current price with proper error handling
+                        current_price = await self.get_current_price(symbol)
+                        if current_price is None:
+                            logger.error(f"Unable to get current price for {symbol}, skipping position monitoring")
+                            return
+                        
+                        # Calculate raw P&L first
+                        try:
+                            entry_price = float(position['info']['price'])
+                            position_side = position['info']['side']
+                            position_size = float(position['info'].get('size', 0))
+                            
+                            raw_pnl_pct = (
+                                ((current_price - entry_price) / entry_price * 100)
+                                if position_side == 'long'
+                                else ((entry_price - current_price) / entry_price * 100)
+                            )
+                            
+                            # Calculate leveraged P&L for display
+                            leveraged_pnl = raw_pnl_pct * self.leverage
+                            
+                            # Log both raw and leveraged P&L
+                            logger.info(f"\nP&L Analysis for {symbol}:")
+                            logger.info(f"Entry: ${entry_price:.4f}")
+                            logger.info(f"Current: ${current_price:.4f}")
+                            logger.info(f"Raw P&L: {raw_pnl_pct:.2f}%")
+                            logger.info(f"Leveraged P&L: {leveraged_pnl:.2f}%")
+                            
+                            # QUICK PROFIT CHECK - Do this before manage_stop_loss
+                            if raw_pnl_pct >= 5.0:  # TP1 at 5%
+                                logger.info(f"🎯 Quick TP1 Check Triggered at {raw_pnl_pct:.2f}%")
+                                tp_size = position_size * 0.3
+                                tp_executed = await self.execute_take_profit(
+                                    symbol=symbol,
+                                    position_side=position_side,
+                                    size=tp_size,
+                                    price=current_price,
+                                    tp_type="TP1",
+                                    is_spot=True
+                                )
+                                if tp_executed:
+                                    return
+                            
+                            if raw_pnl_pct >= 10.0:  # TP2 at 10%
+                                logger.info(f"🎯 Quick TP2 Check Triggered at {raw_pnl_pct:.2f}%")
+                                tp_size = position_size * 0.3
+                                tp_executed = await self.execute_take_profit(
+                                    symbol=symbol,
+                                    position_side=position_side,
+                                    size=tp_size,
+                                    price=current_price,
+                                    tp_type="TP2",
+                                    is_spot=True
+                                )
+                                if tp_executed:
+                                    return
+                            
+                            # Continue with regular position management if no TPs executed
+                            await self.manage_stop_loss(symbol, position, current_price)
+                            
+                        except Exception as e:
+                            logger.error(f"Error calculating P&L for {symbol}: {e}")
+                        
+                    else:
+                        logger.info(f"No active position found for {symbol} ({mapped_symbol})")
+                        
                 except Exception as e:
-                    logger.error(f"Error monitoring {symbol}: {e}")
-                    continue
-                    
-            logger.info("=== FINISHED POSITION MONITORING ===\n")
+                    logger.error(f"Error processing symbol {symbol}: {e}")
             
+            # Process symbols in batches with semaphore for max concurrency
+            semaphore = asyncio.Semaphore(max_workers)
+            
+            async def process_with_semaphore(symbol):
+                async with semaphore:
+                    await process_symbol(symbol)
+            
+            # Process batches
+            for i in range(0, len(symbols), batch_size):
+                batch = symbols[i:i + batch_size]
+                tasks = [process_with_semaphore(symbol) for symbol in batch]
+                await asyncio.gather(*tasks)
+                
         except Exception as e:
-            logger.error(f"Position monitoring error: {e}")
+            logger.error(f"Error in batch position monitoring: {e}")
 
     async def start(self):
-        while True:  # Outer loop for strategy restart
+        while True:  # Add this outer loop
             try:
-                # Initialize tracking dictionaries ONCE
-                self.positions = {}
-                self.last_grid_check = {}
-                self.active_positions = {}
+                # Add a new flag to track if we have sufficient funds
+                self.has_sufficient_funds = True
+                
+                logger.info("Starting grid trading strategy...")
                 
                 # Initialize symbol mappings
                 self.symbol_map = {
-                    'PF_XBTUSD': 'BTC/USD',
-                    'PF_XRPUSD': 'XRP/USD',
-                    'PI_ETHUSD': 'ETH/USD',
-                    'PF_DOGEUSD': 'DOGE/USD',
-                    'PF_LDOUSD': 'LDO/USD',
-                    'PF_ADAUSD': 'ADA/USD',
-                    'PF_MATICUSD': 'MATIC/USD',
-                    'PF_FILUSD': 'FIL/USD',
-                    'PF_APEUSD': 'APE/USD',
-                    'PF_GMXUSD': 'GMX/USD',
-                    'PF_BATUSD': 'BAT/USD',
-                    'PF_XLMUSD': 'XLM/USD',
-
-                    'PF_EOSUSD': 'EOS/USD',
-                    'PF_OPUSD': 'OP/USD',
-                    'PF_AAVEUSD': 'AAVE/USD',
-                    'PF_LINKUSD': 'LINK/USD',
-                    'PF_XMRUSD': 'XMR/USD',
-                    'PF_ATOMUSD': 'ATOM/USD',
-                    'PF_DOTUSD': 'DOT/USD',
-
-                    'PF_ALGOUSD': 'ALGO/USD',
-                    'PF_TRXUSD': 'TRX/USD',
-                    'PF_SOLUSD': 'SOL/USD',
-                    'PF_AVAXUSD': 'AVAX/USD',
-                    'PF_UNIUSD': 'UNI/USD',
-                    'PF_SNXUSD': 'SNX/USD',
-
-                    'PF_NEARUSD': 'NEAR/USD',
-                    'PF_FTMUSD': 'FTM/USD',
-                    'PF_ARBUSD': 'ARB/USD',
-                    'PF_COMPUSD': 'COMP/USD',
-                    'PF_YFIUSD': 'YFI/USD'
+                    'PF_XBTUSD': 'BTC/USD:USD',
+                    'PF_XRPUSD': 'XRP/USD:USD',
+                    'PI_ETHUSD': 'ETH/USD:ETH',
+                    'PF_DOGEUSD': 'DOGE/USD:USD',
+                    'PF_LDOUSD': 'LDO/USD:USD',
+                    'PF_ADAUSD': 'ADA/USD:USD',
+                    'PF_MATICUSD': 'MATIC/USD:USD',
+                    'PF_FILUSD': 'FIL/USD:USD',
+                    'PF_APEUSD': 'APE/USD:USD',
+                    'PF_GMXUSD': 'GMX/USD:USD',
+                    'PF_BATUSD': 'BAT/USD:USD',
+                    'PF_XLMUSD': 'XLM/USD:USD',
+                    'PF_EOSUSD': 'EOS/USD:USD',
+                    'PF_OPUSD': 'OP/USD:USD',
+                    'PF_AAVEUSD': 'AAVE/USD:USD',
+                    'PF_LINKUSD': 'LINK/USD:USD',
+                    'PF_XMRUSD': 'XMR/USD:USD',
+                    'PF_ATOMUSD': 'ATOM/USD:USD',
+                    'PF_DOTUSD': 'DOT/USD:USD',
+                    'PF_ALGOUSD': 'ALGO/USD:USD',
+                    'PF_TRXUSD': 'TRX/USD:USD',
+                    'PF_SOLUSD': 'SOL/USD:USD',
+                    'PF_AVAXUSD': 'AVAX/USD:USD',
+                    'PF_UNIUSD': 'UNI/USD:USD',
+                    'PF_SNXUSD': 'SNX/USD:USD',
+                    'PF_NEARUSD': 'NEAR/USD:USD',
+                    'PF_FTMUSD': 'FTM/USD:USD',
+                    'PF_ARBUSD': 'ARB/USD:USD',
+                    'PF_COMPUSD': 'COMP/USD:USD',
+                    'PF_YFIUSD': 'YFI/USD:USD'
                 }
                 self.reverse_symbol_map = {v: k for k, v in self.symbol_map.items()}
+                
+                # Initialize tracking dictionaries
+                self.positions = {}
+                self.last_grid_check = {}
+                self.active_positions = {}
                 
                 # Retry loop for exchange connection
                 retry_count = 0
                 while retry_count < 5:
                     try:
-                        # Get initial balance and verify positions
-                        balance = await self.exchange.fetch_balance()
+                        # Get initial balance
+                        self.last_balance = await self.get_account_balance()
+                        logger.info(f"Initial balance: {self.last_balance}")
                         
-                        # Verify spot positions and initialize tracking
+                        # Verify spot positions
+                        balance = await self.exchange.fetch_balance()
                         for symbol in self.symbol_map.values():
                             asset = symbol.split('/')[0]
                             spot_balance = float(balance.get(asset, {}).get('free', 0))
@@ -2124,37 +2372,33 @@ class KrakenAdvancedGridStrategy:
                                 try:
                                     orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
                                     buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
-                                    if buy_orders:
-                                        entry_price = float(buy_orders[0]['price'])
-                                        # Update both tracking systems
-                                        self.active_positions[symbol] = {
-                                            'info': {
-                                                'price': entry_price,
-                                                'size': spot_balance,
-                                                'side': 'buy',
-                                                'is_spot': True
-                                            }
-                                        }
-                                        
-                                        self.positions[symbol] = {
-                                            'entry_price': entry_price,
-                                            'position_size': spot_balance,
-                                            'side': 'buy',
-                                            'trailing_stop': None,
-                                            'tp1_triggered': False,
-                                            'tp2_triggered': False,
-                                            'breakeven_triggered': False,
-                                            'trailing_active': False,
-                                            'is_spot': True,
-                                            'stop_buffer': 0.02
-                                        }
-                                        logger.info(f"Initialized position tracking for {symbol} at ${entry_price}")
+                                    entry_price = float(buy_orders[0]['price']) if buy_orders else None
                                 except Exception as e:
-                                    logger.error(f"Error initializing {symbol}: {e}")
-                                    continue
+                                    logger.error(f"Error getting entry price: {e}")
+                                    entry_price = None
+                                
+                                if entry_price:
+                                    logger.error(f"Entry Price: ${entry_price}")
+                                    # Initialize position tracking
+                                    self.positions[symbol] = {
+                                        'entry_price': entry_price,
+                                        'position_size': spot_balance,
+                                        'side': 'buy',
+                                        'trailing_stop': None,
+                                        'tp1_triggered': False,
+                                        'tp2_triggered': False,
+                                        'breakeven_triggered': False,
+                                        'trailing_active': False,
+                                        'is_spot': True,
+                                        'stop_buffer': 0.02
+                                    }
+                                logger.error(f"{'='*50}\n")
+                        
+                        # Get initial positions
+                        positions = await self.verify_actual_positions() or []
+                        logger.info(f"Found {len(positions)} positions on startup")
                         
                         break  # Break retry loop on success
-                        
                     except ccxt.RequestTimeout:
                         retry_count += 1
                         logger.warning(f"Timeout connecting to exchange. Retry {retry_count}/5")
@@ -2177,60 +2421,15 @@ class KrakenAdvancedGridStrategy:
                     try:
                         current_time = time.time()
                         
-                        # Monitor positions first
+                        # Get fresh positions data
+                        positions = await self.get_open_positions()
+                        self.active_positions = {p['symbol']: p for p in positions}
+                        
+                        # Monitor existing positions
                         logger.info("\n=== MONITORING ACTIVE POSITIONS ===")
-                        
-                        # Get both spot and futures positions
-                        positions = await self.verify_actual_positions()
-                        
-                        # Update active positions - using .items() since positions is now a dictionary
-                        for symbol, pos in positions.items():
-                            if symbol not in self.active_positions:
-                                # Get entry price from order history
-                                try:
-                                    orders = await self.exchange.fetch_closed_orders(symbol, limit=5)
-                                    buy_orders = [o for o in orders if o['side'] == 'buy' and o['status'] == 'closed']
-                                    if buy_orders:
-                                        entry_price = float(buy_orders[0]['price'])
-                                    else:
-                                        entry_price = float(pos['info']['price'])
-                                        
-                                    self.active_positions[symbol] = {
-                                        'info': {
-                                            'price': entry_price,
-                                            'size': float(pos['info']['size']),
-                                            'side': 'buy',
-                                            'is_spot': True
-                                        }
-                                    }
-                                    logger.info(f"Found position: {symbol}")
-                                    logger.info(f"Size: {pos['info']['size']}")
-                                    logger.info(f"Entry: {entry_price}")
-                                except Exception as e:
-                                    logger.error(f"Error initializing position for {symbol}: {e}")
-                            else:
-                                # Position already tracked
-                                logger.info(f"Monitoring position: {symbol}")
-                                logger.info(f"Size: {self.active_positions[symbol]['info']['size']}")
-                                logger.info(f"Entry: {self.active_positions[symbol]['info']['price']}")
-                        
-                        if not self.active_positions:
-                            logger.info("No active positions to monitor")
+                        if self.active_positions:
+                            await self.monitor_positions()  # Will now process all positions in batches
                         logger.info("=== FINISHED POSITION MONITORING ===\n")
-                        
-                        # Manage stop losses for active positions
-                        for symbol, position in positions.items():
-                            if symbol in self.active_positions:
-                                current_price = await self.get_current_price(symbol)
-                                await self.manage_stop_loss(symbol, position, current_price)
-                        
-                        # Existing grid logic
-                        for symbol in self.active_symbols:
-                            try:
-                                await self.execute_grid_orders(symbol)
-                            except Exception as e:
-                                logger.error(f"Error executing grid orders for {symbol}: {e}")
-                                continue
                         
                         # Update and process trading symbols
                         await self.update_trading_symbols()
@@ -2248,7 +2447,7 @@ class KrakenAdvancedGridStrategy:
                                 logger.error(f"Error processing symbol {symbol}: {e}")
                                 continue
                             
-                        await asyncio.sleep(60)  # Changed to 60-second interval
+                        await asyncio.sleep(5)  # 5-second interval
                         
                     except ccxt.RequestTimeout:
                         logger.warning("Timeout in main loop, continuing...")
@@ -2273,73 +2472,47 @@ class KrakenAdvancedGridStrategy:
                     self.market_scan_task.cancel()
                 try:
                     await self.exchange.close()
-                except: 
+                except:
                     pass
 
     async def background_market_scan(self):
-        """Enhanced scanner that finds candidates using strict daily analysis"""
+        """Background task to scan and update available markets"""
         try:
-            logger.info("\n🔍 Starting Background Market Scan...")
-            
-            # Get all symbols from our symbol map
-            all_symbols = list(self.symbol_map.values())
-            logger.info(f"Scanning {len(all_symbols)} available symbols")
-            
-            # Apply our strict daily analysis filter
-            filtered_symbols = await self.filter_symbols(all_symbols)
-            
-            if filtered_symbols:
-                logger.info("\n🎯 Top Trading Opportunities:")
-                for symbol in filtered_symbols:
-                    logger.info(f"- {symbol}")
+            while True:
+                logger.info("Running background market scan...")
                 
-                # Update active symbols with the filtered results
-                self.active_symbols = filtered_symbols
-                logger.info(f"Updated active symbols: {self.active_symbols}")
-            else:
-                logger.info("❌ No symbols passed strict daily analysis criteria")
+                # Only scan for new symbols if we have sufficient funds
+                if self.has_sufficient_funds:
+                    # Update available symbols based on balance
+                    available_balance = await self.get_available_balance()
+                    
+                    new_symbols = ['BTC/USD:USD', 'ETH/USD:ETH', 'SOL/USD:USD']  # Base tier
+                    
+                    if available_balance >= 500:
+                        new_symbols.extend(['ATOM/USD:USD', 'LINK/USD:USD'])
+                    if available_balance >= 2000:
+                        new_symbols.extend(['AAVE/USD:USD', 'UNI/USD:USD'])
+                    if available_balance >= 5000:
+                        new_symbols.extend(['DOT/USD:USD', 'AVAX/USD:USD'])
+                        
+                    # Update active symbols
+                    self.active_symbols = list(set(new_symbols))
+                    logger.info(f"Updated active symbols: {self.active_symbols}")
+                else:
+                    # Only track symbols with active positions
+                    self.active_symbols = list(self.active_positions.keys())
+                    logger.info(f"Insufficient funds - Only monitoring active positions: {self.active_symbols}")
                 
-            await asyncio.sleep(300)  # Scan every 5 minutes
-
+                await asyncio.sleep(3600)  # Scan every hour
+                
         except asyncio.CancelledError:
             logger.info("Background market scanner stopped")
         except Exception as e:
             logger.error(f"Error in background market scanner: {e}")
-            await asyncio.sleep(60)  # Wait 1 minute on error
-
-    async def _scan_symbol(self, symbol: str) -> Union[str, None]:
-        """Market scanner pre-filter using analyzer conditions"""
-        try:
-            # Add USD pair check
-            if not symbol.upper().endswith('/USD'):
-                logger.debug(f"Skipping non-USD pair: {symbol}")
-                return None
-                
-            # Get recent data for analysis
-            df = await self.get_historical_data(symbol, '4h', 50)
-            if df is None or len(df) < 20:
-                return None
-                
-            # Check analyzer conditions
-            if not self.market_analyzer.check_volatility(df):
-                return None
-                
-            if not self.market_analyzer.check_trend_strength(df):
-                return None
-                
-            if (datetime.now() - pd.to_datetime(df.index[-1])).seconds > 3600:
-                logger.warning(f"Stale data for {symbol}")
-                return None
-                
-            return symbol
-                
-        except Exception as e:
-            logger.error(f"Scan failed for {symbol}: {e}")
-            return None
 
     async def verify_stop_orders(self, symbol: str, position: dict) -> None:
         try:
-            open_orders = await self.exchange.fetch_open_orders(symbol)
+            open_orders = await self.exchange.fetch_closed_orders(symbol)
             entry_price = float(position['info']['price'])
             position_side = position['info']['side']
             
@@ -2360,7 +2533,7 @@ class KrakenAdvancedGridStrategy:
         """Check active stops and take profits for spot positions"""
         try:
             # Get open orders
-            open_orders = await self.exchange.fetch_open_orders(symbol)
+            open_orders = await self.exchange.fetch_closed_orders(symbol)
             
             # Get current balance and entry price
             balance = await self.exchange.fetch_balance()
@@ -2413,7 +2586,7 @@ class KrakenAdvancedGridStrategy:
         """Verify stop order was placed and place emergency stop if needed"""
         try:
             # Get all open orders
-            open_orders = await self.exchange.fetch_open_orders(symbol)
+            open_orders = await self.exchange.fetch_closed_orders(symbol)
             
             # Check for existing stop orders
             stop_orders = [
@@ -2495,19 +2668,13 @@ class KrakenAdvancedGridStrategy:
                     tf_df['ema200'] = talib.EMA(tf_df['close'], timeperiod=200)
                     
                     # RSI
-                    tf_df['rsi'] = talib.RSI(tf_df['close'], timeperiod=14)
+                    tf_df['rsi'] = ta.momentum.RSIIndicator(tf_df['close'], window=14).rsi()
                     
-
                     # MACD
-                    macd_line, signal_line, macd_hist = talib.MACD(
-                        tf_df['close'], 
-                        fastperiod=self.macd_fast,  # Correct parameter name
-                        slowperiod=self.macd_slow,   # Correct parameter name
-                        signalperiod=self.macd_signal
-                    )
-                    tf_df['macd'] = macd_line
-                    tf_df['macd_signal'] = signal_line
-                    tf_df['macd_hist'] = macd_hist
+                    macd = ta.trend.MACD(tf_df['close'])
+                    tf_df['macd'] = macd.macd()
+                    tf_df['macd_signal'] = macd.macd_signal()
+                    tf_df['macd_hist'] = macd.macd_diff()
                     
                     tech_scores[tf] = {
                         'rsi': tf_df['rsi'].iloc[-1],
@@ -2536,8 +2703,8 @@ class KrakenAdvancedGridStrategy:
                 logger.error(f"Invalid position size for {symbol}")
                 return []
 
-            total_fees = await self.calculate_total_fees(current_price, avg_position_size, symbol)  # Added await here
-            min_profit_needed = max(total_fees * 1.5, 0.02)  # Combine both requirements
+            total_fees = self.calculate_total_fees(current_price, avg_position_size, symbol)
+            min_profit_needed = total_fees * 2
 
             logger.info(f"\nGrid Profitability Analysis for {symbol}:")
             logger.info(f"Min Profit Needed: ${min_profit_needed:.4f}")
@@ -2678,10 +2845,10 @@ class KrakenAdvancedGridStrategy:
         return tech_boost
 
     async def update_trading_symbols(self) -> None:
-        """Dynamically update trading symbols based on account growth and technical analysis"""
+        """Dynamically update trading symbols based on account growth and volume"""
         try:
             current_time = time.time()
-            if current_time - self.last_symbol_update < 3600:  # Still check hourly
+            if current_time - self.last_symbol_update < 3600:
                 return
 
             logger.info("\n=== Updating Trading Symbols ===")
@@ -2708,11 +2875,11 @@ class KrakenAdvancedGridStrategy:
                 new_symbols.extend(self.tier4_symbols)
                 logger.info("Account above $5000 - Adding ETH and remaining symbols")
 
-            # Apply technical analysis filter using our daily criteria
-            logger.info(f"Analyzing {len(new_symbols)} symbols for technical setups...")
+            # Apply volume and price filters BEFORE setting active symbols
+            logger.info(f"Filtering {len(new_symbols)} initial symbols...")
             filtered_symbols = await self.filter_symbols(new_symbols)
             
-            logger.info(f"Found {len(filtered_symbols)} symbols matching our criteria")
+            logger.info(f"Filtered down to top {len(filtered_symbols)} symbols by volume")
             self.active_symbols = filtered_symbols
             
             self.last_symbol_update = current_time
@@ -2760,11 +2927,10 @@ class KrakenAdvancedGridStrategy:
                 # Update active positions based on actual spot balances
                 self.active_positions = {
                     symbol: {
-                        'info': {
-                            'price': entry_price,
-                            'size': spot_balance,
-                            'side': 'buy'
-                        }
+                        'symbol': symbol,
+                        'size': spot_balance,
+                        'entry_price': entry_price,
+                        'is_spot': True
                     }
                 }
                 
@@ -2894,26 +3060,25 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.error(f"Error reassessing grids for {symbol}: {e}")
 
-    async def calculate_total_fees(self, price: float, size: float, symbol: str) -> float:
-        """Calculate total round-trip fees including entry and exit"""
+    def calculate_total_fees(self, price: float, size: float, is_maker: bool = True) -> float:
+        """Calculate total fees including slippage and volatility buffer"""
         try:
-            # Get current exchange fees - ENSURE THIS IS AWAITED
-            maker_fee, taker_fee = await self.get_exchange_fees(symbol)
+            # Base fee calculation
+            fee_rate = self.maker_fee if is_maker else self.taker_fee
+            base_fee = price * size * fee_rate
             
-            # Calculate fees for spot trading
-            entry_fee = price * size * maker_fee
-            exit_fee = price * size * taker_fee
+            # Add slippage and volatility buffers
+            total_buffer = self.slippage_buffer + self.volatility_buffer
+            buffer_cost = price * size * total_buffer
             
-            total_fees = entry_fee + exit_fee
+            total_cost = base_fee + buffer_cost
             
-            # Log fee breakdown with actual rates
-            logger.info(f"\nFee Breakdown for {symbol}:")
-            logger.info(f"Entry Fee: ${entry_fee:.4f} (Maker Rate: {maker_fee:.4%})")
-            logger.info(f"Exit Fee: ${exit_fee:.4f} (Taker Rate: {taker_fee:.4%})")
-            logger.info(f"Total Fees: ${total_fees:.4f}")
+            logger.info(f"Fee Calculation:")
+            logger.info(f"Base Fee: ${base_fee:.4f} ({fee_rate*100}%)")
+            logger.info(f"Buffer Cost: ${buffer_cost:.4f} ({total_buffer*100}%)")
+            logger.info(f"Total Cost: ${total_cost:.4f}")
             
-            return total_fees
-                
+            return total_cost
         except Exception as e:
             logger.error(f"Error calculating fees: {e}")
             return 0.0
@@ -2994,15 +3159,13 @@ class KrakenAdvancedGridStrategy:
         return expected_profit * safety_margin
 
     async def get_tradeable_instruments(self) -> Dict[str, List[str]]:
-        """Fetch and categorize instruments with minimum notional validation"""
+        """Fetch and categorize instruments from Kraken Spot"""
         try:
-            # Get portfolio-based limits
-            balance = await self.exchange.fetch_balance()
-            portfolio_value = float(balance['total']['USD'])
-            max_min_notional = portfolio_value * self.max_risk_per_trade
-            
+            # Use CCXT to fetch markets and tickers
             markets = await self.exchange.fetch_markets()
             tickers = await self.exchange.fetch_tickers()
+            
+            logger.info(f"Fetched {len(markets)} markets and {len(tickers)} tickers")
             
             categorized_symbols = {
                 'tier1': [],  # $100-500
@@ -3010,80 +3173,58 @@ class KrakenAdvancedGridStrategy:
                 'tier3': [],  # $2000-5000
                 'tier4': []   # $5000+
             }
-
+            
+            # Process each market
             for market in markets:
                 try:
                     symbol = market['symbol']
-                    
-                    # Filter criteria
-                    if not (symbol.endswith('/USD') and 
-                           market['spot'] and 
-                           market['active'] and
-                           symbol not in self.STABLE_BLACKLIST):
+                    # Only include USD pairs and spot markets
+                    if not symbol.endswith('/USD') or market.get('type') != 'spot':
                         continue
-                    
-                    # Get market details
-                    min_amount = market['limits']['amount']['min']
-                    price = tickers[symbol]['last'] if symbol in tickers else 0
-                    if not price:
-                        continue
-                    
-                    # Calculate minimum notional value
-                    min_notional = min_amount * price
-                    if min_notional > max_min_notional:
-                        logger.info(f"Excluding {symbol} - Min notional ${min_notional:.2f} > Max ${max_min_notional:.2f}")
-                        continue
-                    
-                    # Categorize by price tier
-                    if price < 500:
-                        tier = 'tier1'
-                    elif price < 2000:
-                        tier = 'tier2'
-                    elif price < 5000:
-                        tier = 'tier3'
-                    else:
-                        tier = 'tier4'
-                    
-                    categorized_symbols[tier].append(symbol)
-                    logger.info(f"Approved {symbol} | Price: ${price:.2f} | Min Notional: ${min_notional:.2f}")
-
+                        
+                    # Get current price from tickers
+                    if symbol in tickers and tickers[symbol].get('last'):
+                        price = float(tickers[symbol]['last'])
+                        
+                        if price > 0:
+                            if price < 500:
+                                categorized_symbols['tier1'].append(symbol)
+                            elif price < 2000:
+                                categorized_symbols['tier2'].append(symbol)
+                            elif price < 5000:
+                                categorized_symbols['tier3'].append(symbol)
+                            else:
+                                categorized_symbols['tier4'].append(symbol)
+                            logger.info(f"Added {symbol} at ${price:.2f}")
+                            
                 except Exception as e:
-                    logger.error(f"Error processing {market.get('id', 'unknown')}: {e}")
+                    logger.error(f"Error processing market {market.get('symbol', 'unknown')}: {e}")
                     continue
-
-            # Log final selection
-            logger.info("\nFinal Tradeable Instruments:")
+            
+            # Log the categorization
+            logger.info("\nTradeable Spot Instruments by Tier:")
             for tier, symbols in categorized_symbols.items():
-                logger.info(f"\n{tier.upper()} ({len(symbols)} symbols):")
-                for sym in sorted(symbols):
-                    if sym in tickers:
-                        price = tickers[sym]['last']
-                        min_amount = next(m['limits']['amount']['min'] for m in markets if m['symbol'] == sym)
-                        logger.info(f"- {sym} | Price: ${price:.2f} | Min Size: {min_amount}")
-
+                logger.info(f"\n{tier.upper()} (Count: {len(symbols)}):")
+                for symbol in sorted(symbols):
+                    if symbol in tickers and tickers[symbol].get('last'):
+                        price = float(tickers[symbol]['last'])
+                        logger.info(f"- {symbol} (${price:.2f})")
+            
             return categorized_symbols
-
+            
         except Exception as e:
             logger.error(f"Error fetching instruments: {e}")
-            return {k: [] for k in ['tier1', 'tier2', 'tier3', 'tier4']}
+            logger.exception("Full traceback:")
+            
+            # Return empty lists if something went wrong
+            return {
+                'tier1': [],
+                'tier2': [],
+                'tier3': [],
+                'tier4': []
+            }
 
-    async def analyze_multi_timeframe_trend(self, symbol: str, timeframe_results: dict = None) -> dict:
-        """Analyze multi-timeframe trend using pre-calculated results if available"""
-        if timeframe_results:
-            # Use pre-calculated results
-            trend_results = {}
-            
-            # Map timeframe analyses to expected format
-            if '5m' in timeframe_results:
-                trend_results['15m'] = self._format_trend_result(timeframe_results['5m'])
-            if '1h' in timeframe_results:
-                trend_results['1h'] = self._format_trend_result(timeframe_results['1h'])
-            if 'daily' in timeframe_results:
-                trend_results['1d'] = self._format_trend_result(timeframe_results['daily'])
-            
-            return trend_results
-        
-        # Fallback to original calculation if no pre-calculated results
+    async def analyze_multi_timeframe_trend(self, symbol: str) -> dict:
         timeframes = {
             '15m': {'fast_ema': 20, 'slow_ema': 50},
             '1h': {'fast_ema': 50, 'slow_ema': 200},
@@ -3116,19 +3257,18 @@ class KrakenAdvancedGridStrategy:
                     df[f'ema_{emas["slow_ema"]}'] = df['close'].ewm(span=emas['slow_ema'], adjust=False).mean()
                     
                     # Add RSI
-                    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
+                    df['rsi'] = ta.momentum.RSIIndicator(df['close'], self.rsi_period).rsi()
                     
-
                     # Add MACD
-                    macd_line, signal_line, macd_hist = talib.MACD(
+                    macd = ta.trend.MACD(
                         df['close'], 
-                        fastperiod=self.macd_fast, 
-                        slowperiod=self.macd_slow,   
-                        signalperiod=self.macd_signal
+                        window_slow=self.macd_slow, 
+                        window_fast=self.macd_fast, 
+                        window_sign=self.macd_signal
                     )
-                    df['macd'] = macd_line
-                    df['macd_signal'] = signal_line
-                    df['macd_histogram'] = macd_hist
+                    df['macd'] = macd.macd()
+                    df['macd_signal'] = macd.macd_signal()
+                    df['macd_histogram'] = macd.macd_diff()
                     
                     # Get S/R levels with Fibonacci
                     support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
@@ -3157,21 +3297,6 @@ class KrakenAdvancedGridStrategy:
                 continue
         
         return trend_results
-
-    def _format_trend_result(self, analysis_result: dict) -> dict:
-        """Format individual timeframe analysis into trend result format"""
-        return {
-            'trend': 'bullish' if analysis_result.get('ema_bullish', False) else 'bearish',
-            'strength': analysis_result.get('signal_strength', 0) * 100,
-            'rsi': analysis_result.get('rsi', 50),
-            'macd_hist': analysis_result.get('macd_histogram', 0),
-            'is_oversold': analysis_result.get('rsi', 50) < 30,
-            'is_overbought': analysis_result.get('rsi', 50) > 70,
-            'support_levels': analysis_result.get('support_levels', []),
-            'resistance_levels': analysis_result.get('resistance_levels', []),
-            'near_support': analysis_result.get('near_support', False),
-            'near_resistance': analysis_result.get('near_resistance', False)
-        }
 
     def validate_grid_levels(self, levels: List[dict], trend_data: dict) -> List[dict]:
         """Validate grid levels against trend and Fibonacci"""
@@ -3329,915 +3454,130 @@ class KrakenAdvancedGridStrategy:
             return False, 0.0
 
     async def filter_symbols(self, symbols: List[str]) -> List[str]:
-        """Market-analyzer enhanced symbol filtering with strict daily requirements"""
-        try:
-            # Stage 0: Remove blacklisted symbols
-            filtered = [s for s in symbols if s not in self.STABLE_BLACKLIST]
-            
-            logger.info(f"Starting analysis of {len(filtered)} symbols")
-            
-            # Stage 1: Parallel market analysis with daily requirements
-            analysis_tasks = [
-                self._analyze_symbol(sym)
-                for sym in filtered  # Analyze all symbols now that liquidity filter is removed
-            ]
-            results = await asyncio.gather(*analysis_tasks)
-            
-            # Stage 2: Only keep symbols that passed daily analysis (confidence > 0)
-            valid_symbols = [(sym, score) for sym, score in results if score > 7.0]  # Requiring 70% confidence
-            
-            if not valid_symbols:
-                logger.info("❌ No symbols passed strict daily analysis criteria")
-                return []
-            
-            # Sort by confidence score
-            sorted_symbols = sorted(valid_symbols, key=lambda x: x[1], reverse=True)
-            
-            # Get top 3 symbols with highest confidence
-            selected = [sym for sym, _ in sorted_symbols[:3]]
-            
-            logger.info("\n🎯 Selected Symbols:")
-            for sym, score in sorted_symbols[:3]:
-                logger.info(f"{sym}: Confidence {score:.2f}/10")
-            
-            return selected
-            
-        except Exception as e:
-            logger.error(f"Filter error: {e}")
-            return []
-
-    async def scan_market(self):
-        """Enhanced market scanner with detailed logging"""
-        try:
-            logger.info("\n🔍 Starting Market Scan...")
-            
-            # Get all available symbols
-            markets = await self.exchange.load_markets()
-            all_symbols = [market for market in markets.keys() 
-                          if market.endswith('/USD')]  # Only USD pairs
-            
-            logger.info(f"Found {len(all_symbols)} USD pairs")
-            
-            # Filter symbols
-            filtered_symbols = await self.filter_symbols(all_symbols)
-            
-            if filtered_symbols:
-                logger.info("\n🎯 Top Trading Opportunities:")
-                for symbol in filtered_symbols:
-                    logger.info(f"- {symbol}")
-            else:
-                logger.info("❌ No symbols passed filtering criteria")
-                
-            return filtered_symbols
-            
-        except Exception as e:
-            logger.error(f"Market scan error: {e}")
-            return []
-
-    async def _analyze_symbol(self, symbol: str) -> Tuple[str, float]:
-        """Market analyzer for breakout validation with daily fib levels"""
-        try:
-            daily_df = await self.get_historical_data(symbol, '1d', limit=200)
-            if daily_df is None or len(daily_df) < 200:
-                return symbol, 0.0
-
-            # Calculate EMAs
-            daily_df['ema9'] = talib.EMA(daily_df['close'], 9)
-            daily_df['ema21'] = talib.EMA(daily_df['close'], 21)
-            daily_df['ema200'] = talib.EMA(daily_df['close'], 200)
-            
-            current_close = daily_df['close'].iloc[-1]
-            ema9 = daily_df['ema9'].iloc[-1]
-            ema21 = daily_df['ema21'].iloc[-1]
-            ema200 = daily_df['ema200'].iloc[-1]
-            
-            # 1. EMA Breakout Check
-            ema_cross = (ema9 > ema21 and 
-                        daily_df['ema9'].iloc[-2] <= daily_df['ema21'].iloc[-2] and
-                        current_close > ema200)
-            
-            if not ema_cross:
-                logger.info(f"{symbol} ❌ No EMA breakout")
-                return symbol, 0.0
-
-            # 2. RSI Cross Above Signal
-            rsi = talib.RSI(daily_df['close'], 14)
-            rsi_signal = talib.SMA(rsi, 14)  # 14-period signal line
-            rsi_cross = (rsi.iloc[-1] > rsi_signal.iloc[-1] and 
-                        rsi.iloc[-2] <= rsi_signal.iloc[-2])
-            
-            if not rsi_cross:
-                logger.info(f"{symbol} ❌ No RSI cross")
-                return symbol, 0.0
-
-            # 3. MACD Breakout
-            macd_line, signal_line, _ = talib.MACD(daily_df['close'])
-            macd_cross = (macd_line.iloc[-1] > signal_line.iloc[-1] and 
-                         macd_line.iloc[-2] <= signal_line.iloc[-2])
-            
-            if not macd_cross:
-                logger.info(f"{symbol} ❌ No MACD cross")
-                return symbol, 0.0
-
-            # 4. ATR Volatility Check
-            atr = talib.ATR(daily_df['high'], daily_df['low'], daily_df['close'], 14).iloc[-1]
-            atr_pct = (atr / current_close) * 100
-            if atr_pct <= 1.5:
-                logger.info(f"{symbol} ❌ ATR too low: {atr_pct:.2f}%")
-                return symbol, 0.0
-
-            # 5. Volume Breakout
-            volume = daily_df['volume'].iloc[-1]
-            vol_ma = daily_df['volume'].rolling(20).mean().iloc[-1]
-            volume_breakout = volume > vol_ma * 1.5  # 50% above average
-            
-            if not volume_breakout:
-                logger.info(f"{symbol} ❌ No volume breakout")
-                return symbol, 0.0
-
-            # 6. Breaking Above Fib Levels
-            swing_high = daily_df['high'].rolling(50).max().iloc[-1]
-            swing_low = daily_df['low'].rolling(50).min().iloc[-1]
-            fib_levels = [
-                swing_high - (swing_high - swing_low) * level 
-                for level in [0.236, 0.382, 0.5, 0.618, 0.786]
-            ]
-            
-            # Check if breaking above any fib level with volume
-            breaking_fib = any(
-                current_close > level and daily_df['close'].iloc[-2] <= level 
-                for level in fib_levels
-            )
-            
-            if not breaking_fib:
-                logger.info(f"{symbol} ❌ No fib breakout")
-                return symbol, 0.0
-
-            # Calculate confidence score (0-10)
-            confidence = 0.0
-            confidence += 2.0  # EMA breakout
-            confidence += 2.0  # RSI cross
-            confidence += 2.0  # MACD cross
-            confidence += min(2.0, atr_pct / 2)  # ATR
-            confidence += 2.0 if volume > vol_ma * 2 else 1.0  # Volume strength
-
-            logger.info(f"{symbol} ✅ Breakout detected! Confidence: {confidence:.2f}")
-            logger.info(f"  - ATR: {atr_pct:.2f}%")
-            logger.info(f"  - Volume: {volume/vol_ma:.1f}x average")
-            
-            return symbol, confidence
-
-        except Exception as e:
-            logger.error(f"Analysis failed for {symbol}: {e}")
-            return symbol, 0.0
-
-    async def _quick_liquidity_filter(self, symbols):
-        """Fast pre-filter based on volume and balance"""
-        balance = await self.get_account_balance()
-        max_size = balance * 0.2
+        """Pre-filter symbols before detailed analysis - rescans hourly"""
+        filtered = []
+        current_time = time.time()
         
-        tickers = await self.exchange.fetch_tickers()
-        return [
-            sym for sym in symbols
-            if tickers.get(sym, {}).get('quoteVolume', 0) > 1_000_000
-            and tickers[sym]['last'] * 3 <= max_size
+        # Check if an hour has passed since last scan
+        if hasattr(self, 'last_scan_time') and current_time - self.last_scan_time < 3600:
+            logger.info("Using existing filtered symbols (next scan in {:.1f} minutes)".format(
+                (3600 - (current_time - self.last_scan_time)) / 60
+            ))
+            return self.last_filtered_symbols if hasattr(self, 'last_filtered_symbols') else []
+        
+        logger.info(f"\n{'='*50}")
+        logger.info(f"🔍 HOURLY SYMBOL SCAN - PRE-FILTERING {len(symbols)} SYMBOLS")
+        logger.info(f"{'='*50}")
+        
+        # Get available balance first
+        available_balance = await self.get_available_balance()  # Changed from get_account_balance
+        logger.info(f"Available Balance: ${available_balance:.2f}")
+        
+        # Calculate max position size (e.g., 20% of account)
+        max_position_size = available_balance * 0.20
+        logger.info(f"Max Position Size: ${max_position_size:.2f}")
+        
+        # Restricted pairs for US/TX
+        restricted_pairs = [
+            'EUR', 'GBP', 'CHF', 'AUD', 'CAD', 'JPY',  # Fiat pairs
+            'USDC', 'USDT', 'DAI', 'BUSD'  # Stablecoins
         ]
-
-    async def validate_entry_conditions(self, symbol: str, df: pd.DataFrame) -> bool:
-        """Optimized entry validation with parallel technical analysis"""
+        
         try:
-            # Validate input DataFrame
-            if df is None or len(df) < self.atr_periods:
-                logger.warning(f"Insufficient data for {symbol}")
-                return False
-
-            # Calculate position size first
-            size = await self.calculate_position_size(symbol)
-            if size <= 0:
-                logger.warning(f"Skipping {symbol} - invalid size")
-                return False
-
-            # Batch load multi-timeframe data with validation
-            timeframes = ['1d', '4h', '1h', '5m']
-            dfs = await asyncio.gather(
-                *[self.get_historical_data(symbol, tf) for tf in timeframes],
-                return_exceptions=True
-            )
+            # Get all tickers at once for efficiency
+            tickers = await self.exchange.fetch_tickers()
             
-            # Check for exceptions in timeframe data
-            if any(isinstance(d, Exception) for d in dfs):
-                logger.error(f"Error fetching timeframe data for {symbol}")
-                return False
-                
-            daily_df, four_hour_df, hourly_df, five_min_df = dfs
-            
-            # Validate all timeframes have sufficient data and required columns
-            if any(d is None or len(d) < self.atr_periods or not {'open','high','low','close'}.issubset(d.columns) 
-                   for d in [daily_df, four_hour_df, hourly_df, five_min_df]):
-                logger.warning(f"Insufficient multi-timeframe data for {symbol}")
-                return False
-
-            # Parallel technical analysis with error handling
-            try:
-                analysis_tasks = [
-                    self._analyze_daily(daily_df, symbol),
-                    self._analyze_4h(four_hour_df, symbol),
-                    self._analyze_1h(hourly_df, symbol),
-                    self._analyze_5m(five_min_df, symbol)
-                ]
-                results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
-
-                # Check for exceptions in results
-                if any(isinstance(r, Exception) for r in results):
-                    logger.error(f"Analysis error in timeframe analysis")
-                    return False
-                
-                daily_ok, fourh_ok, hour_ok, five_min_ok = results
-                
-            except Exception as e:
-                logger.error(f"Technical analysis error: {e}")
-                return False
-
-            # Combined validation
-            if not all([daily_ok, fourh_ok, hour_ok, five_min_ok]):
-                return False
-
-            # Batch sentiment check with validation
-            if len(daily_df) > 0:  # Make sure we have data
-                # Validate OHLC columns exist in daily data
-                if not all(col in daily_df.columns for col in ['open', 'high', 'low', 'close']):
-                    logger.error(f"Missing OHLC columns in daily data for {symbol}")
-                    return False
-                
-                sentiment_params = {
-                    'timeframe': '1d',
-                    'price_data': {
-                        'open': daily_df['open'].astype(float).tolist(),
-                        'high': daily_df['high'].astype(float).tolist(),
-                        'low': daily_df['low'].astype(float).tolist(),
-                        'close': daily_df['close'].astype(float).tolist()
-                    }
-                }
+            # Filter and sort by volume, considering account size
+            tradeable_symbols = []
+            for symbol in symbols:
                 try:
-                    sentiment_score = await self.market_analyzer.get_market_sentiment(sentiment_params, symbol)
-                    if sentiment_score < 0.6:
-                        logger.info(f"❌ Insufficient sentiment score: {sentiment_score:.2f}")
-                        return False
+                    if (symbol in tickers and 
+                        tickers[symbol]['quoteVolume'] is not None and 
+                        not any(restricted in symbol for restricted in restricted_pairs)):
+                        
+                        ticker = tickers[symbol]
+                        price = ticker['last']
+                        
+                        # Calculate minimum position size (e.g., 3 units)
+                        min_position_cost = price * 3  # Minimum 3 units
+                        
+                        # Check if we can trade at least 3 units and price is reasonable
+                        if (min_position_cost <= max_position_size and 
+                            ticker['quoteVolume'] > 1000000 and  # Min 1M daily volume
+                            'USD' in symbol):
+                            
+                            tradeable_symbols.append({
+                                'symbol': symbol,
+                                'price': price,
+                                'volume': ticker['quoteVolume'],
+                                'min_cost': min_position_cost
+                            })
+                            
                 except Exception as e:
-                    logger.error(f"Sentiment analysis error: {e}")
-                    return False
-            else:
-                logger.warning("Insufficient data for sentiment analysis")
-                return False
-
-            # New volatility check ===============
-            try:
-                current_price = float(df['close'].iloc[-1])
-                volatility = await self.get_asset_volatility(symbol)
-                
-                if volatility >= 0.6:  # 60% volatility threshold
-                    logger.info(f"❌ Volatility too high: {volatility*100:.2f}%")
-                    return False
-                logger.info(f"✅ Acceptable volatility: {volatility*100:.2f}%")
-            except Exception as e:
-                logger.error(f"Volatility check failed: {e}")
-                return False
-
-            # Add bear market bounce check here 
-            market_state = "bull" if daily_df['close'].iloc[-1] > daily_df['close'].iloc[-200] else "bear"
-            if market_state == "bear":
-                if not await self.detect_bear_bounce(five_min_df):
-                    logger.info("❌ No bear market bounce detected")
-                    return False
-
-            # Final price structure check with validation
-            try:
-                if len(df['close']) == 0:
-                    logger.error("Empty price data")
-                    return False
-                    
-                current_price = float(df['close'].iloc[-1])
-                resistance_check = await self._check_resistance_levels(symbol, current_price)
-                
-                # Position validation - only if position exists
-                if symbol in self.positions:
-                    position = self.positions[symbol]
-                    if isinstance(position, dict):
-                        entry_price = position.get('entry_price')
-                        if entry_price is None:
-                            logger.warning(f"No entry price found for existing position in {symbol}")
-                    else:
-                        logger.warning(f"Invalid position data format for {symbol}")
-                
-                return resistance_check
-                
-            except Exception as e:
-                logger.error(f"Price structure check error: {e}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Validation error for {symbol}: {e}")
-            return False
-
-    async def _analyze_daily(self, df: pd.DataFrame, symbol: str) -> bool:
-        """Strict daily chart analysis with fib retracement confirmation"""
-        try:
-            # EMA Structure
-            df['ema9'] = talib.EMA(df['close'], 9)
-            df['ema21'] = talib.EMA(df['close'], 21)
-            df['ema200'] = talib.EMA(df['close'], 200)
+                    continue
             
-            current_close = df['close'].iloc[-1]
-            ema9 = df['ema9'].iloc[-1]
-            ema21 = df['ema21'].iloc[-1]
-            ema200 = df['ema200'].iloc[-1]
+            # Sort by volume and filter top symbols
+            volume_sorted = sorted(
+                tradeable_symbols,
+                key=lambda x: x['volume'],
+                reverse=True
+            )[:20]  # Take top 20
             
-            # 1. EMA Alignment Check
-            ema_cross = ema9 > ema21 and df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
-            above_ema200 = current_close > ema200
+            # Log detailed analysis
+            logger.info("\nTradeable Symbols Analysis:")
+            logger.info(f"{'Symbol':<12} {'Price':<10} {'Volume(M)':<12} {'Min Cost':<10}")
+            logger.info("-" * 44)
             
-            # 2. RSI and ATR Requirements
-            rsi = talib.RSI(df['close'], 14).iloc[-1]
-            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            atr_pct = (atr / current_close) * 100
-            
-            # 3. MACD Cross
-            macd_line, signal_line, _ = talib.MACD(df['close'])
-            macd_bullish = (macd_line.iloc[-1] > signal_line.iloc[-1] and 
-                           macd_line.iloc[-2] <= signal_line.iloc[-2])
-            
-            # 4. Fibonacci Retracement Levels
-            swing_high = df['high'].rolling(50).max().iloc[-1]
-            swing_low = df['low'].rolling(50).min().iloc[-1]
-            fib_levels = {
-                0.382: swing_high - (swing_high - swing_low) * 0.382,
-                0.5: swing_high - (swing_high - swing_low) * 0.5,
-                0.618: swing_high - (swing_high - swing_low) * 0.618
-            }
-            
-            # Check if price is retracing to fib levels
-            near_fib = any(abs(current_close - level) < current_close * 0.015 
-                          for level in fib_levels.values())
-            
-            # 5. Volume Confirmation (current > 20-period average)
-            volume_ma = df['volume'].rolling(20).mean().iloc[-1]
-            volume_ok = df['volume'].iloc[-1] > volume_ma * 1.2
-            
-            logger.info(f"DAILY ANALYSIS ({symbol}):")
-            logger.info(f"EMA 9/21 Cross: {'✅' if ema_cross else '❌'}")
-            logger.info(f"Price > EMA200: {'✅' if above_ema200 else '❌'} ({ema200:.4f})")
-            logger.info(f"RSI > 50: {'✅' if rsi > 50 else '❌'} ({rsi:.2f})")
-            logger.info(f"ATR > 1.5%: {'✅' if atr_pct > 1.5 else '❌'} ({atr_pct:.2f}%)")
-            logger.info(f"MACD Bull Cross: {'✅' if macd_bullish else '❌'}")
-            logger.info(f"Near Fib Level: {'✅' if near_fib else '❌'}")
-            logger.info(f"Volume Spike: {'✅' if volume_ok else '❌'}")
-
-            return all([
-                ema_cross,
-                above_ema200,
-                rsi > 50,
-                atr_pct > 1.5,
-                macd_bullish,
-                near_fib,
-                volume_ok
-            ])
-            
-        except Exception as e:
-            logger.error(f"Daily analysis error: {e}")
-            return False
-
-    async def _analyze_4h(self, df: pd.DataFrame, symbol: str) -> bool:
-        """4-hour trend analysis - Relaxed Version"""
-        try:
-            # Simplified EMA Structure
-            df['ema9'] = talib.EMA(df['close'], 9)
-            
-            # Price Relationships (keep basic trend check)
-            price_above_ema9 = df['close'].iloc[-1] > df['ema9'].iloc[-1]
-            
-            # Momentum Indicators (keep core requirements)
-            macd_line, signal_line, _ = talib.MACD(df['close'])
-            histogram = macd_line - signal_line
-
-            macd_bullish = (
-                (macd_line.iloc[-1] > signal_line.iloc[-1]) and
-                (histogram.iloc[-1] > histogram.iloc[-2])
-            )
-            
-            rsi = talib.RSI(df['close'], 14).iloc[-1]
-            rsi_above_45 = rsi > 45  # Relaxed from 50
-            
-            # Volatility Check (keep existing)
-            current_price = df['close'].iloc[-1]
-            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            valid_atr = 1.0 <= (atr/current_price)*100 <= 3.5
-            
-            # Volume Validation (relaxed multiplier)
-            volume = df['volume'].iloc[-1]
-            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
-            strong_volume = volume > vol_ma * 1.1  # Reduced from 1.2
-            
-            # Support Check (wider threshold)
-            support_levels, _ = await self.calculate_support_resistance(df, symbol)
-            near_support = any(abs(current_price - s)/s < 0.015 for s in support_levels[:3])
-            
-            logger.info(f"\n4H Analysis for {symbol}:")
-            logger.info(f"Price > EMA9: {'✅' if price_above_ema9 else '❌'}") 
-            logger.info(f"MACD Bullish: {'✅' if macd_bullish else '❌'} | RSI: {rsi:.1f}")
-            logger.info(f"ATR: {(atr/current_price)*100:.1f}% | Volume: {'✅' if strong_volume else '❌'}")
-            logger.info(f"Near Support: {'✅' if near_support else '❌'}")
-
-            return all([
-                price_above_ema9,
-                macd_bullish,
-                rsi_above_45,
-                valid_atr,
-                strong_volume,
-                near_support
-            ])
-            
-        except Exception as e:
-            logger.error(f"4H analysis error: {e}")
-            return False
-
-    async def _analyze_1h(self, df: pd.DataFrame, symbol: str) -> bool:
-        """1-hour trend confirmation for 15min entries - Relaxed Version"""
-        try:
-            # Keep EMA calculations for reference but remove cross requirement
-            df['ema9'] = talib.EMA(df['close'], 9)
-            df['ema21'] = talib.EMA(df['close'], 21)
-            
-            # Simplified price relationship check
-            price_above_ema9 = df['close'].iloc[-1] > df['ema9'].iloc[-1]
-            
-            # Momentum Check (keep existing)
-            macd_line, signal_line, _ = talib.MACD(df['close'])
-            histogram = macd_line - signal_line
-            macd_bullish = (
-                (macd_line.iloc[-1] > signal_line.iloc[-1]) and
-                (histogram.iloc[-1] > histogram.iloc[-2]) and
-                (macd_line.iloc[-1] > 0)
-            )
-            
-            # Keep other existing checks
-            current_price = df['close'].iloc[-1]
-            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            valid_atr = 1.0 <= (atr/current_price)*100 <= 3.0
-            
-            volume = df['volume'].iloc[-1]
-            vol_ma = df['volume'].rolling(20).mean().iloc[-1]
-            strong_volume = volume > vol_ma * 1.15
-            
-            support_levels, _ = await self.calculate_support_resistance(df, symbol)
-            near_support = any(abs(current_price - s)/s < 0.008 for s in support_levels[:3])
-            
-            # Updated logging
-            logger.info(f"\n1H Analysis for {symbol}:")
-            logger.info(f"Price > EMA9: {'✅' if price_above_ema9 else '❌'}")
-            logger.info(f"MACD Bullish: {'✅' if macd_bullish else '❌'} | ATR: {(atr/current_price)*100:.1f}%")
-            logger.info(f"Volume: {'✅' if strong_volume else '❌'} | Near Support: {'✅' if near_support else '❌'}")
-
-            # Simplified return conditions
-            return all([
-                price_above_ema9,  # Basic trend alignment
-                macd_bullish,
-                valid_atr,
-                strong_volume,
-                near_support
-            ])
-            
-        except Exception as e:
-            logger.error(f"1H analysis error: {e}")
-            return False
-
-    async def _analyze_5m(self, df: pd.DataFrame, symbol: str) -> Tuple[bool, dict]:
-        try:
-            # EMA Structure
-            df['ema9'] = talib.EMA(df['close'], 9)
-            df['ema21'] = talib.EMA(df['close'], 21)
-            
-            # More lenient trend requirements - either crossing or trending up
-            current_above = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
-            prev_below = df['ema9'].iloc[-2] <= df['ema21'].iloc[-2]
-            ema_trending_up = df['ema9'].iloc[-1] > df['ema9'].iloc[-2]
-            ema_bullish = (current_above and prev_below) or ema_trending_up
-            
-            # Relaxed MACD conditions
-            macd_line, signal_line, _ = talib.MACD(
-                df['close'],
-                fastperiod=self.macd_fast,
-                slowperiod=self.macd_slow,
-                signalperiod=self.macd_signal
-            )
-            histogram = macd_line - signal_line
-            macd_bullish = (
-                (macd_line.iloc[-1] > signal_line.iloc[-1]) or  # Either crossing
-                (histogram.iloc[-1] > histogram.iloc[-2])        # Or gaining momentum
-            )
-            
-            # Relaxed RSI conditions
-            rsi = talib.RSI(df['close'], 14).iloc[-1]
-            rsi_prev = talib.RSI(df['close'], 14).iloc[-2]
-            rsi_bullish = (rsi > rsi_prev) and (rsi < 70)  # Just trending up and not overbought
-            
-            # Volume validation with lower threshold
-            current_volume = df['volume'].iloc[-1]
-            vol_ma = df['volume'].rolling(20, min_periods=1).mean().iloc[-1]
-            volume_spike = current_volume > vol_ma * 1.1  # Reduced from 1.3
-            
-            # Wider ATR range
-            current_price = df['close'].iloc[-1]
-            atr = talib.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            valid_atr = 0.01 <= (atr/current_price) <= 0.04  # Wider range 1-4%
-            
-            # Support check with wider threshold
-            _, fifteen_m_supports = await self.calculate_support_resistance(df, symbol)
-            near_support = any(abs(current_price - s)/s < 0.008 for s in fifteen_m_supports[:3])
-            
-            # More lenient candle pattern
-            last_candle = df.iloc[-1]
-            bullish_candle = last_candle['close'] > last_candle['open']  # Just needs to be green
-            
-            # Logging
-            logger.info(f"\n5M Analysis for {symbol}:")
-            logger.info(f"EMA Cross/Trend: {'✅' if ema_bullish else '❌'} | MACD: {'✅' if macd_bullish else '❌'}")
-            logger.info(f"Volume: {current_volume/vol_ma:.1f}x MA | ATR: {(atr/current_price)*100:.1f}%")
-            logger.info(f"Near Support: {'✅' if near_support else '❌'} | Bullish Candle: {'✅' if bullish_candle else '❌'}")
-            logger.info(f"RSI Trend Up: {'✅' if rsi_bullish else '❌'} ({rsi_prev:.1f} → {rsi:.1f})")
-
-            # Need fewer conditions to be true
-            required_conditions = [
-                ema_bullish or macd_bullish,  # Either EMA or MACD is bullish
-                rsi_bullish,                  # RSI trending up
-                volume_spike,                 # Decent volume
-                valid_atr,                    # Reasonable volatility
-                near_support or bullish_candle # Either near support or bullish candle
-            ]
-            
-            analysis_result = {
-                'ema_bullish': ema_bullish,
-                'macd_bullish': macd_bullish,
-                'rsi': rsi,
-                'macd_histogram': histogram.iloc[-1],
-                'signal_strength': sum(required_conditions) / len(required_conditions),
-                'support_levels': fifteen_m_supports,
-                'near_support': near_support,
-                'volume_spike': volume_spike,
-                'valid_atr': valid_atr
-            }
-            
-            return sum(required_conditions) >= 4, analysis_result
-            
-        except Exception as e:
-            logger.error(f"5M analysis error: {e}")
-            return False, {}
-
-    async def _validate_symbol(self, symbol):
-        """Parallel technical validation for a single symbol"""
-        try:
-            # Add multi-timeframe data loading
-            timeframes = ['1d', '4h', '1h', '5m']
-            daily_df, four_hour_df, hourly_df, five_min_df = await asyncio.gather(
-                *[self.get_historical_data(symbol, tf) for tf in timeframes]
-            )
-            
-            # Original validation logic continues...
-            df = await self.get_historical_data(symbol)
-            if df is None or df.empty:
-                return False
-
-            # Add proper sentiment analysis with data validation
-            try:
-                # First validate the DataFrame structure
-                required_columns = ['open', 'high', 'low', 'close']
-                if not all(col in daily_df.columns for col in required_columns):
-                    missing = [col for col in required_columns if col not in daily_df.columns]
-                    logger.error(f"Missing columns in daily data: {missing}")
-                    return False
-
-                # Then convert values
-                sentiment_params = {
-                    'timeframe': '1d',
-                    'price_data': {
-                        'open': [float(x) for x in daily_df['open'].tolist()],
-                        'high': [float(x) for x in daily_df['high'].tolist()],
-                        'low': [float(x) for x in daily_df['low'].tolist()],
-                        'close': [float(x) for x in daily_df['close'].tolist()]
-                    }
-                }
-                sentiment_score = await self.market_analyzer.get_market_sentiment(
-                    data=sentiment_params, 
-                    symbol=symbol
+            for item in volume_sorted:
+                filtered.append(item['symbol'])
+                logger.info(
+                    f"{item['symbol']:<12} "
+                    f"${item['price']:<9.2f} "
+                    f"${item['volume']/1000000:<11.1f}M "
+                    f"${item['min_cost']:<9.2f}"
                 )
-                logger.info(f"Sentiment Score: {sentiment_score:.2f}")
-                
-                if sentiment_score < 0.6:
-                    logger.info(f"❌ Market sentiment not bullish enough: {sentiment_score:.2f}")
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"Sentiment analysis failed: {e}")
-                return False
-
-            # Continue with existing validation logic...
-            current_price = float(df['close'].iloc[-1])
-            volume = float(df['volume'].iloc[-1])
-            volume_ma = df['volume'].rolling(window=20).mean().iloc[-1]
             
-            logger.info(f"\n{'='*50}")
-            logger.info(f"VALIDATING ENTRY - {symbol}")
-            logger.info(f"Price: ${current_price:.4f}")
+            # Store scan time and filtered symbols
+            self.last_scan_time = current_time
+            self.last_filtered_symbols = filtered
             
-            # Calculate base technical indicators
-            rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1]
-            bb_upper, bb_middle, bb_lower = talib.BBANDS(df['close'], timeperiod=20)
-            bb_width = (bb_upper.iloc[-1] - bb_lower.iloc[-1]) / bb_middle.iloc[-1]
-
-            atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
-            
-
-            # Daily timeframe conditions
-            daily_ema9 = talib.EMA(daily_df['close'], timeperiod=9)
-            daily_ema21 = talib.EMA(daily_df['close'], timeperiod=21)
-            
-            # Define daily EMA cross
-            daily_ema_cross = (
-                daily_ema9.iloc[-1] > daily_ema21.iloc[-1] and
-                daily_ema9.iloc[-2] <= daily_ema21.iloc[-2]
-            )
-
-            # Then use the condition
-            if not daily_ema_cross:
-                logger.info("❌ No daily 9/21 EMA bullish cross")
-                return False
-            
-            daily_rsi = talib.RSI(daily_df['close'], timeperiod=14).iloc[-1]
-            daily_rsi_prev = talib.RSI(daily_df['close'], timeperiod=14).iloc[-2]
-            daily_macd = talib.trend.MACD(daily_df['close'])
-
-            daily_macd_cross = (
-                daily_macd.macd().iloc[-1] > daily_macd.macd_signal().iloc[-1] and
-                daily_macd.macd().iloc[-2] <= daily_macd.macd_signal().iloc[-2]
-            )
-            
-            # Check if near daily fib support
-            support_levels, resistance_levels = await self.calculate_support_resistance(daily_df, symbol)
-            near_support = any(abs(current_price - s) / s < 0.02 for s in support_levels)
-            
-            logger.info("\nDaily Timeframe:")
-            logger.info(f"EMA 9/21 Cross: {'✅' if daily_ema_cross else '❌'}")
-            logger.info(f"RSI: {daily_rsi:.1f} (Previous: {daily_rsi_prev:.1f})")
-            logger.info(f"MACD Bullish Cross: {'✅' if daily_macd_cross else '❌'}")
-            logger.info(f"Near Fib Support: {'✅' if near_support else '❌'}")
-            
-            # Add this as a primary condition
-            if not daily_ema_cross:
-                logger.info("❌ No daily 9/21 EMA bullish cross")
-                return False
-            
-            # Small cap specific checks
-            if current_price < 5.0:  # Small cap threshold
-                # 1. Check daily conditions first
-                if not (daily_rsi > 30 and daily_rsi_prev <= 30):
-                    logger.info("❌ Daily RSI not showing bullish cross above 30")
-                    return False
-                    
-                if not daily_macd_cross:
-                    logger.info("❌ Daily MACD not showing bullish cross")
-                    return False
-                    
-                if not near_support:
-                    logger.info("❌ Price not near daily fib support")
-                    return False
-                
-                # 2. Check 4H and 1H RSI
-                four_hour_rsi = talib.RSI(four_hour_df['close'], timeperiod=14).iloc[-1]
-                hourly_rsi = talib.RSI(hourly_df['close'], timeperiod=14).iloc[-1]
-                
-
-                if four_hour_rsi < 50 or hourly_rsi < 50:
-                    logger.info("❌ 4H or 1H RSI below 50")
-                    return False
-                
-                # 3. Original small cap checks
-                if rsi > 35:
-                    logger.info(f"❌ RSI too high for small cap: {rsi:.1f}")
-                    return False
-                
-                min_volume = volume_ma * 1.5
-                if volume < min_volume:
-                    logger.info(f"❌ Volume too low: {volume:,.0f} < {min_volume:,.0f}")
-                    return False
-                
-                if bb_width > 0.4:
-                    logger.info(f"❌ BB Width too high: {bb_width:.3f}")
-                    return False
-                
-                if (atr/current_price) > 0.04:  # 4% threshold
-                    logger.info(f"❌ ATR too high: {(atr/current_price)*100:.1f}%")
-                    return False
-                
-                # New addition: Minimum ATR requirement (1.5-3% daily range)
-                elif (atr/current_price) < 0.015:  # 1.5% threshold
-                    logger.info(f"❌ ATR too low: {(atr/current_price)*100:.1f}% - Stagnant price action")
-                    return False
-                
-                # 4. Check 5min EMAs and MACD
-                ema9 = talib.EMA(five_min_df['close'], timeperiod=9).iloc[-1]
-                ema21 = talib.EMA(five_min_df['close'], timeperiod=21).iloc[-1]
-                ema200 = talib.EMA(five_min_df['close'], timeperiod=200).iloc[-1]
-                
-
-                if not (ema9 > ema21 > ema200):
-                    logger.info("❌ EMAs not in bullish alignment")
-                    return False
-                
-                five_min_macd = ta.MACD(five_min_df['close'])
-                if five_min_macd.macd().iloc[-1] < five_min_macd.macd_signal().iloc[-1]:
-                    logger.info("❌ 5min MACD not showing upward momentum")
-                    return False
-                
-                logger.info("\n✅ Small cap entry conditions met:")
-                logger.info(f"- Daily RSI cross and MACD bullish")
-                logger.info(f"- 4H and 1H RSI above 50")
-                logger.info(f"- 5min EMAs and MACD bullish")
-                logger.info(f"- Strong volume and controlled volatility")
-                
-            else:  # Regular entry conditions for higher priced assets
-                # Keep existing conditions and add multi-timeframe checks
-                if not (daily_rsi > 30 and daily_rsi_prev <= 30):
-                    logger.info("❌ Daily RSI not showing bullish cross above 30")
-                    return False
-                
-                if not daily_macd_cross:
-                    logger.info("❌ Daily MACD not showing bullish cross")
-                    return False
-                
-                if rsi > 40:
-                    logger.info(f"❌ RSI too high: {rsi:.1f}")
-                    return False
-                
-                if volume < volume_ma:
-                    logger.info(f"❌ Volume below average: {volume:,.0f} < {volume_ma:,.0f}")
-                    return False
-                
-                # Technical Structure
-                ema9 = talib.EMA(df['close'], timeperiod=9).iloc[-1]
-                ema21 = talib.EMA(df['close'], timeperiod=21).iloc[-1]
-                ema200 = talib.EMA(df['close'], timeperiod=200).iloc[-1]
-                
-
-                # Check EMA alignment for trend
-                if current_price < ema200:
-                    logger.info("❌ Price below 200 EMA - Not in uptrend")
-                    return False
-                
-                if ema9 < ema21:
-                    logger.info("❌ EMAs in bearish alignment (9 < 21)")
-                    return False
-                
-                # Keep existing volatility and MACD checks
-                if bb_width > 0.5:
-                    logger.info(f"❌ BB Width too high: {bb_width:.3f}")
-                    return False
-                
-                if (atr/current_price) > 0.04:
-                    logger.info(f"❌ ATR too high: {(atr/current_price)*100:.1f}%")
-                    return False
-                
-                # 5. MACD Momentum
-                macd = talib.MACD(df['close'])
-                if macd.macd().iloc[-1] < macd.macd_signal().iloc[-1]:
-                    logger.info("❌ MACD below signal line - Weak momentum")
-                    return False
-
-                
-                logger.info("\n✅ Regular asset entry conditions met:")
-                logger.info(f"- Daily timeframe confirmation")
-                logger.info(f"- RSI and volume criteria met")
-                logger.info(f"- EMAs in bullish alignment")
-                logger.info(f"- Controlled volatility")
-                logger.info(f"- Strong momentum")
-            
-            # Final resistance check for both types
-            try:
-                if resistance_levels:
-                    nearest_resistance = min(r for r in resistance_levels if r > current_price)
-                    distance_to_resistance = (nearest_resistance - current_price) / current_price
-                    
-                    # If price is within 3% of resistance, reject entry
-                    if distance_to_resistance < 0.03:
-                        logger.info(f"❌ Too close to resistance: {distance_to_resistance*100:.1f}% away")
-                        return False
-                        
-                    logger.info(f"✅ Clear distance to resistance: {distance_to_resistance*100:.1f}%")
-                else:
-                    logger.info("✅ No immediate resistance above")
-                    
-            except Exception as e:
-                logger.error(f"Error checking resistance: {e}")
-                return False
-            
-            logger.info(f"{'='*50}\n")
-            return True
+            logger.info(f"\n✨ Selected {len(filtered)} symbols within account trading range")
+            logger.info(f"Account size: ${available_balance:.2f}")
+            logger.info(f"Max position: ${max_position_size:.2f}")
+            logger.info("Next scan in 60 minutes")
+            return filtered
             
         except Exception as e:
-            logger.error(f"Error validating entry conditions: {e}")
-            return False
+            logger.error(f"Error in filter_symbols: {e}")
+            # Return major pairs that are likely within our range
+            return ['XRP/USD', 'ADA/USD', 'DOGE/USD', 'DOT/USD']  # Lower-priced majors as fallback
 
-    async def check_all_positions(self) -> None:
-        """Debug helper to check all positions and balances"""
+    def normalize_symbol(self, symbol: str) -> str:
+        """Normalize symbol format for Kraken"""
         try:
-            balance = await self.exchange.fetch_balance()
+            # Remove any suffixes like :USD or :ETH
+            base_symbol = symbol.split(':')[0]
             
-            logger.info("\n=== CHECKING ALL SPOT POSITIONS ===")
-            for currency, amount in balance.items():
-                total = float(amount.get('total', 0))
-                free = float(amount.get('free', 0))
-                used = float(amount.get('used', 0))
-                
-                if total > 0:
-                    logger.info(f"\nFound {currency}:")
-                    logger.info(f"Total: {total}")
-                    logger.info(f"Free: {free}")
-                    logger.info(f"Used: {used}")
-                    
-                    # Try to get recent orders for this asset
-                    try:
-                        symbol = f"{currency}/USD"
-                        orders = await self.exchange.fetch_closed_orders(symbol, limit=3)
-                        if orders:
-                            logger.info(f"Recent orders for {symbol}:")
-                            for order in orders:
-                                logger.info(f"Order: {order['side']} {order['amount']} @ {order['price']}")
-                    except Exception as e:
-                        logger.info(f"Could not fetch orders for {currency}: {e}")
-                        
-            logger.info("=" * 50)
+            # Map of common symbol corrections
+            symbol_map = {
+                'BTC/USD': 'BTC/USD',  # Kraken uses XBT instead of BTC
+                'WBTC/USD': 'WBTC/USD',
+                'ETH/USD': 'ETH/USD',
+                'SOL/USD': 'SOL/USD',
+                'XRP/USD': 'XRP/USD',
+                'ADA/USD': 'ADA/USD',
+                'DOGE/USD': 'DOGE/USD',
+                'DOT/USD': 'DOT/USD',
+                'LTC/USD': 'LTC/USD'
+            }
+            
+            normalized = symbol_map.get(base_symbol, base_symbol)
+            logger.info(f"Normalized {symbol} to {normalized}")
+            return normalized
             
         except Exception as e:
-            logger.error(f"Error checking positions: {e}")
-
-    async def quick_profit_check(self, symbol: str, position: Dict, current_price: float) -> bool:
-        """Fast profit check and TP execution without other overhead"""
-        try:
-            entry_price = float(position['info']['price'])
-            position_side = position['info'].get('side', 'long')
-            position_size = float(position['info'].get('size', 0))
-            is_spot = True  # For now we're forcing spot
-            
-            # Quick profit calc
-            profit_pct = ((current_price - entry_price) / entry_price) * 100
-            
-            # Check TP1 (5%)
-            if profit_pct >= 5.0:
-                tp_size = position_size * 0.3
-                await self.execute_take_profit(symbol, position_side, tp_size, current_price, "TP1", is_spot)
-                return True
-                
-            # Check TP2 (10%)
-            if profit_pct >= 10.0:
-                tp_size = position_size * 0.3
-                await self.execute_take_profit(symbol, position_side, tp_size, current_price, "TP2", is_spot)
-                return True
-                
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error in quick profit check: {e}")
-            return False
-
-    async def get_available_balance(self) -> float:
-        """Get actual available balance accounting for open orders"""
-        try:
-            balance = await self.exchange.fetch_balance()
-            
-            # Get USD balance directly from response
-            usd_balance = float(balance.get('USD', {}).get('free', 0.0))
-            
-            # Get committed funds from open orders
-            open_orders = await self.exchange.fetch_open_orders()
-            committed_funds = sum(
-                float(order['price']) * float(order['amount'])
-                for order in open_orders
-                if order['side'] == 'buy'
-            )
-        
-            actual_available = usd_balance - committed_funds
-            logger.info(f"\nBalance Analysis:")
-            logger.info(f"USD Balance: ${usd_balance:.2f}")
-            logger.info(f"Committed in Orders: ${committed_funds:.2f}")
-            logger.info(f"Actually Available: ${actual_available:.2f}")
-    
-            # Update sufficient funds flag
-            self.has_sufficient_funds = actual_available > 15  # Minimum $15 available
-    
-            return actual_available
-        
-        except Exception as e:
-            logger.error(f"Error calculating available balance: {e}")
-            logger.error(f"Error details: {str(e)}")
-            return 0.0
+            logger.error(f"Error normalizing symbol {symbol}: {e}")
+            return symbol  # Return original if normalization fails
 
     async def execute_stop_loss(self, symbol: str, position_size: float, is_spot: bool, reason: str = "stop loss") -> bool:
         """Execute stop loss order with retries and confirmation"""
@@ -4300,399 +3640,383 @@ class KrakenAdvancedGridStrategy:
         logger.error(f"❌ Failed to execute {reason} after {max_retries} attempts")
         return False
 
-    async def validate_grid_order_size(self, symbol: str, size: float) -> float:
-        """Validate and adjust order size for spot trading"""
+    async def validate_order_size(self, symbol: str, amount: float) -> bool:
+        """Always validate order size as true to allow any size orders"""
         try:
-            # Get market info
-            market = self.exchange.market(symbol)
-            min_size = float(market['limits']['amount']['min'])
-            base_currency = symbol.split('/')[0]
-            available = await self.get_available_balance()
-            
-            # Check available balance first
-            if available < size:
-                logger.warning(f"Insufficient {base_currency} balance: {available} < {size}")
-                return 0.0
-                
-            # Increase size if below minimum
-            if size < min_size:
-                logger.warning(f"⚠️ Increasing size to meet {symbol} minimum {min_size}")
-                size = min_size * 1.01  # Add 1% buffer
-            
-            # Round to appropriate precision
-            precision = int(market['precision']['amount'])
-            return round(float(size), precision)
+            logger.info(f"Allowing order for {symbol} with size {amount}")
+            return True
             
         except Exception as e:
-            logger.error(f"Size validation error: {e}")
-            return 0.0
+            logger.error(f"Error in order size validation: {e}")
+            return True  # Still return True on error to allow order
 
-    async def verify_actual_positions(self) -> Dict[str, Dict]:
-        """Verify actual positions vs open orders with precise FIFO tracking"""
+    async def validate_grid_order_size(self, symbol: str, size: float) -> float:
+        """Validate if grid order size meets exchange minimums"""
         try:
-            balance = await self.exchange.fetch_balance()
-            markets = await self.exchange.fetch_markets()
+            # Get market info from exchange
+            market = self.exchange.market(symbol)
+            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
             
-            # Create symbol mapping
-            symbol_map = {m['base'].replace('XBT','BTC').replace('XX','').replace('Z','').replace('.S',''): m['symbol'] 
-                         for m in markets if m['quote'] == 'USD' and '/USD' in m['symbol']}
-
-            actual_positions = {}  # Changed to dictionary
-            for currency, amount in balance.get('total', {}).items():
-                clean_currency = currency.replace('XBT','BTC').replace('XX','').replace('Z','').replace('.S','')
+            if size < min_amount:
+                logger.warning(f"Grid order size {size} is below minimum {min_amount} for {symbol}")
+                # Calculate the adjusted size to meet minimum
+                adjusted_size = min_amount * 1.01  # Add 1% buffer
+                logger.info(f"Adjusting grid order size to {adjusted_size}")
+                return adjusted_size
                 
-                if clean_currency not in symbol_map:
-                    continue
+            return size
+            
+        except Exception as e:
+            logger.error(f"Error validating grid order size: {e}")
+            return size  # Return original size if validation fails
 
+    async def verify_actual_positions(self) -> List[Dict]:
+        """Verify actual positions vs open orders"""
+        try:
+            # Get actual balances
+            balance = await self.exchange.fetch_balance()
+            
+            # Track actual positions
+            actual_positions = []
+            
+            for currency, amount in balance.get('free', {}).items():
+                if currency in ['USD', 'USDT']:
+                    continue
+                
                 total_amount = float(amount)
-                if total_amount > 0.000001:
-                    try:
-                        proper_symbol = symbol_map[clean_currency]
-                        
-                        # Get ALL trades for this symbol
-                        since = self.exchange.milliseconds() - (86400 * 1000 * 30)
-                        trades = await self.exchange.fetch_my_trades(proper_symbol, since=since)
-                        
-                        # FIFO processing with sell reconciliation
-                        fifo_queue = []
-                        for trade in sorted(trades, key=lambda x: x['timestamp']):
-                            trade_size = float(trade['amount'])
-                            
-                            if trade['side'] == 'buy':
-                                fifo_queue.append((trade_size, float(trade['price'])))
-                            elif trade['side'] == 'sell':
-                                remaining_sell = trade_size
-                                while remaining_sell > 0 and fifo_queue:
-                                    oldest_size, oldest_price = fifo_queue[0]
-                                    if oldest_size > remaining_sell:
-                                        fifo_queue[0] = (oldest_size - remaining_sell, oldest_price)
-                                        remaining_sell = 0
-                                    else:
-                                        remaining_sell -= oldest_size
-                                        fifo_queue.pop(0)
-                        
-                        # Calculate remaining position cost basis
-                        total_cost = 0
-                        accumulated = 0
-                        for size, price in fifo_queue:
-                            if accumulated + size > total_amount:
-                                partial = total_amount - accumulated
-                                total_cost += partial * price
-                                accumulated = total_amount
-                                break
-                            else:
-                                total_cost += size * price
-                                accumulated += size
-                        
-                        entry_price = total_cost / accumulated if accumulated > 0 else await self.get_current_price(proper_symbol)
+                if total_amount > 0.00001:  # Minimum threshold
+                    symbol = f"{currency}/USD"
+                    
+                    # Get actual entry price from order history
+                    orders = await self.exchange.fetch_open_orders(symbol)
+                    filled_buys = [o for o in orders if o['side'] == 'buy' and o['status'] == 'open']
+                    
+                    if filled_buys:
+                        entry_price = float(filled_buys[0]['price'])
+                        logger.info(f"Found actual position for {symbol}:")
+                        logger.info(f"Balance: {total_amount} {currency}")
+                        logger.info(f"Entry: ${entry_price}")
                         
                         position = {
-                            'symbol': proper_symbol,
+                            'symbol': symbol,
                             'info': {
-                                'symbol': proper_symbol,
+                                'symbol': symbol,
                                 'size': total_amount,
                                 'price': entry_price,
                                 'side': 'long',
-                                'is_spot': True,
-                                'start_time': time.time()
+                                'is_spot': True
                             }
                         }
-                        
-                        # Add debug logging here
-                        logger.debug(f"Position type: {type(position)}")
-                        logger.debug(f"Position data: {position}")
-                        
-                        # Update both tracking systems with complete fields
-                        self.active_positions[proper_symbol] = position
-                        self.positions[proper_symbol] = {
-                            'entry_price': entry_price,
-                            'position_size': total_amount,
-                            'side': 'buy',
-                            'start_time': time.time(),
-                            'trailing_stop': None,
-                            'tp1_triggered': False,
-                            'tp2_triggered': False,
-                            'breakeven_triggered': False,
-                            'trailing_active': False,
-                            'stop_buffer': 0.002,
-                            'original_size': total_amount,
-                            'is_spot': True,
-                            'spot_balance': total_amount
-                        }
-                        
-                        actual_positions[proper_symbol] = position  # Changed to dictionary assignment
-                        logger.info(f"Verified position: {proper_symbol} - Entry: {entry_price:.6f}")
-                        
-                    except Exception as e:
-                        logger.error(f"Position error {clean_currency}: {str(e)[:100]}")
-                        continue
-
-            # Add validation before returning
-            if not actual_positions:
-                logger.info("No active positions found")
-                return {}  # Return empty dict instead of empty list
-                
-            # Add detailed debug logging here
-            logger.debug(f"Final positions type: {type(actual_positions)}")
-            for sym, pos in actual_positions.items():
-                logger.debug(f"Position for {sym} - Type: {type(pos)}")
-                logger.debug(f"Position data: {pos}")
+                        actual_positions.append(position)
             
-            logger.debug(f"Verified positions: {actual_positions}")
             return actual_positions
-
-        except Exception as e:
-            logger.error(f"Position verification failed: {e}")
-            return {}  # Return empty dict on error
-
-    async def _check_resistance_levels(self, symbol, current_price):
-        """Check if current price is near any resistance level"""
-        try:
-            df = await self.get_historical_data(symbol)
-            if df is None or df.empty:
-                return False
-            
-            # Ensure DataFrame has required columns
-            required_columns = ['high', 'low', 'close']
-            if not all(col in df.columns for col in required_columns):
-                logger.error(f"DataFrame for {symbol} missing required columns: {df.columns}")
-                return False
-
-            support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
-            return any(abs(current_price - r) / r < 0.03 for r in resistance_levels)
-        except Exception as e:
-            logger.error(f"Error checking resistance levels for {symbol}: {e}")
-            return False
-
-    def normalize_symbol(self, symbol: str) -> str:
-        """Normalize symbol format for Kraken API"""
-        # Kraken requires symbols like 'XLM/USD' instead of 'XLMUSD'
-        if '/' not in symbol:
-            # Handle different symbol formats
-            base = symbol[:3] if len(symbol) == 6 else symbol[:4]
-            quote = symbol[3:] if len(symbol) == 6 else symbol[4:]
-            return f"{base}/{quote}"
-        return symbol.upper().replace(' ', '').replace('-', '')
-
-    async def get_average_entry_price(self, symbol: str, position_size: float, mid_price: float) -> float:
-        """Get exact entry price using FIFO accounting"""
-        try:
-            # Check if we already have accurate tracking
-            if symbol in self.positions:
-                tracked_price = self.positions[symbol].get('entry_price')
-                if tracked_price and tracked_price > 0:
-                    return tracked_price
-
-            # Calculate from trade history with FIFO matching
-            since = self.exchange.milliseconds() - (86400 * 1000 * 7)  # 1 week
-            all_trades = await self.exchange.fetch_my_trades(symbol, since=since)
-            
-            if not all_trades:
-                return mid_price
-
-            # Process trades in chronological order with FIFO
-            fifo_queue = []
-            
-            for trade in sorted(all_trades, key=lambda x: x['timestamp']):
-                trade_size = float(trade['amount'])
-                trade_price = float(trade['price'])
                 
-                if trade['side'] == 'buy':
-                    fifo_queue.append((trade_size, trade_price))
-                elif trade['side'] == 'sell':
-                    # Remove from oldest buys first
-                    while trade_size > 0 and fifo_queue:
-                        oldest_size, oldest_price = fifo_queue[0]
-                        if oldest_size > trade_size:
-                            fifo_queue[0] = (oldest_size - trade_size, oldest_price)
-                            trade_size = 0
-                        else:
-                            trade_size -= oldest_size
-                            fifo_queue.pop(0)
+        except Exception as e:
+            logger.error(f"Error verifying actual positions: {e}")
+            return []  # Return empty list on error
 
-            # Calculate remaining position cost basis
-            total_cost = 0
-            accumulated = 0
+    async def validate_entry_conditions(self, symbol: str, df: pd.DataFrame) -> bool:
+        """Enhanced multi-timeframe entry validation"""
+        try:
+            # Get multi-timeframe data
+            daily_df = await self.get_historical_data(symbol, timeframe='1d')
+            four_hour_df = await self.get_historical_data(symbol, timeframe='4h')
+            hourly_df = await self.get_historical_data(symbol, timeframe='1h')
+            five_min_df = df  # Current 5m dataframe
+
+            # Add sentiment analysis
+            sentiment_data = await self.market_analyzer.analyze_market_sentiment(symbol, '1d')
+            if sentiment_data and sentiment_data.get('confidence', 0) > 0.8:
+                sentiment_score = sentiment_data['sentiment']['positive']
+                logger.info(f"Sentiment Score: {sentiment_score:.2f}")
+                
+                if sentiment_score < 0.6:
+                    logger.info("❌ Market sentiment not bullish enough")
+                    return False
+
+            # Continue with existing validation logic...
+            current_price = float(df['close'].iloc[-1])
+            volume = float(df['volume'].iloc[-1])
+            volume_ma = df['volume'].rolling(window=20).mean().iloc[-1]
             
-            for size, price in fifo_queue:
-                if accumulated + size > position_size:
-                    partial = position_size - accumulated
-                    total_cost += partial * price
-                    accumulated = position_size
-                    break
+            logger.info(f"\n{'='*50}")
+            logger.info(f"VALIDATING ENTRY - {symbol}")
+            logger.info(f"Price: ${current_price:.4f}")
+            
+            # Calculate base technical indicators
+            rsi = ta.RSI(df['close'], timeperiod=14).iloc[-1]
+            bb_upper, bb_middle, bb_lower = ta.BBANDS(df['close'], timeperiod=20)
+            bb_width = (bb_upper.iloc[-1] - bb_lower.iloc[-1]) / bb_middle.iloc[-1]
+            atr = ta.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+            
+            # Daily timeframe conditions
+            daily_ema9 = ta.EMA(daily_df['close'], timeperiod=9)
+            daily_ema21 = ta.EMA(daily_df['close'], timeperiod=21)
+            
+            # Define daily EMA cross
+            daily_ema_cross = (
+                daily_ema9.iloc[-1] > daily_ema21.iloc[-1] and
+                daily_ema9.iloc[-2] <= daily_ema21.iloc[-2]
+            )
+
+            # Then use the condition
+            if not daily_ema_cross:
+                logger.info("❌ No daily 9/21 EMA bullish cross")
+                return False
+            
+            daily_rsi = ta.RSI(daily_df['close'], timeperiod=14).iloc[-1]
+            daily_rsi_prev = ta.RSI(daily_df['close'], timeperiod=14).iloc[-2]
+            daily_macd = ta.MACD(daily_df['close'])
+            daily_macd_cross = (
+                daily_macd.macd().iloc[-1] > daily_macd.macd_signal().iloc[-1] and
+                daily_macd.macd().iloc[-2] <= daily_macd.macd_signal().iloc[-2]
+            )
+            
+            # Check if near daily fib support
+            support_levels, resistance_levels = await self.calculate_support_resistance(daily_df, symbol)
+            near_support = any(abs(current_price - s) / s < 0.02 for s in support_levels)
+            
+            logger.info("\nDaily Timeframe:")
+            logger.info(f"EMA 9/21 Cross: {'✅' if daily_ema_cross else '❌'}")
+            logger.info(f"RSI: {daily_rsi:.1f} (Previous: {daily_rsi_prev:.1f})")
+            logger.info(f"MACD Bullish Cross: {'✅' if daily_macd_cross else '❌'}")
+            logger.info(f"Near Fib Support: {'✅' if near_support else '❌'}")
+            
+            # Add this as a primary condition
+            if not daily_ema_cross:
+                logger.info("❌ No daily 9/21 EMA bullish cross")
+                return False
+            
+            # Small cap specific checks
+            if current_price < 5.0:  # Small cap threshold
+                # 1. Check daily conditions first
+                if not (daily_rsi > 30 and daily_rsi_prev <= 30):
+                    logger.info("❌ Daily RSI not showing bullish cross above 30")
+                    return False
+                    
+                if not daily_macd_cross:
+                    logger.info("❌ Daily MACD not showing bullish cross")
+                    return False
+                    
+                if not near_support:
+                    logger.info("❌ Price not near daily fib support")
+                    return False
+                
+                # 2. Check 4H and 1H RSI
+                four_hour_rsi = ta.RSI(four_hour_df['close'], timeperiod=14).iloc[-1]
+                hourly_rsi = ta.RSI(hourly_df['close'], timeperiod=14).iloc[-1]
+                
+                if four_hour_rsi < 50 or hourly_rsi < 50:
+                    logger.info("❌ 4H or 1H RSI below 50")
+                    return False
+                
+                # 3. Original small cap checks
+                if rsi > 35:
+                    logger.info(f"❌ RSI too high for small cap: {rsi:.1f}")
+                    return False
+                
+                min_volume = volume_ma * 1.5
+                if volume < min_volume:
+                    logger.info(f"❌ Volume too low: {volume:,.0f} < {min_volume:,.0f}")
+                    return False
+                
+                if bb_width > 0.4:
+                    logger.info(f"❌ BB Width too high: {bb_width:.3f}")
+                    return False
+                
+                if (atr/current_price) > 0.03:
+                    logger.info(f"❌ ATR too high: {(atr/current_price)*100:.1f}%")
+                    return False
+                
+                # 4. Check 5min EMAs and MACD
+                ema9 = ta.EMA(five_min_df['close'], timeperiod=9).iloc[-1]
+                ema21 = ta.EMA(five_min_df['close'], timeperiod=21).iloc[-1]
+                ema200 = ta.EMA(five_min_df['close'], timeperiod=200).iloc[-1]
+                
+                if not (ema9 > ema21 > ema200):
+                    logger.info("❌ EMAs not in bullish alignment")
+                    return False
+                
+                five_min_macd = ta.MACD(five_min_df['close'])
+                if five_min_macd.macd().iloc[-1] < five_min_macd.macd_signal().iloc[-1]:
+                    logger.info("❌ 5min MACD not showing upward momentum")
+                    return False
+                
+                logger.info("\n✅ Small cap entry conditions met:")
+                logger.info(f"- Daily RSI cross and MACD bullish")
+                logger.info(f"- 4H and 1H RSI above 50")
+                logger.info(f"- 5min EMAs and MACD bullish")
+                logger.info(f"- Strong volume and controlled volatility")
+                
+            else:  # Regular entry conditions for higher priced assets
+                # Keep existing conditions and add multi-timeframe checks
+                if not (daily_rsi > 30 and daily_rsi_prev <= 30):
+                    logger.info("❌ Daily RSI not showing bullish cross above 30")
+                    return False
+                
+                if not daily_macd_cross:
+                    logger.info("❌ Daily MACD not showing bullish cross")
+                    return False
+                
+                if rsi > 40:
+                    logger.info(f"❌ RSI too high: {rsi:.1f}")
+                    return False
+                
+                if volume < volume_ma:
+                    logger.info(f"❌ Volume below average: {volume:,.0f} < {volume_ma:,.0f}")
+                    return False
+                
+                # Technical Structure
+                ema9 = ta.EMA(df['close'], timeperiod=9).iloc[-1]
+                ema21 = ta.EMA(df['close'], timeperiod=21).iloc[-1]
+                ema200 = ta.EMA(df['close'], timeperiod=200).iloc[-1]
+                
+                # Check EMA alignment for trend
+                if current_price < ema200:
+                    logger.info("❌ Price below 200 EMA - Not in uptrend")
+                    return False
+                
+                if ema9 < ema21:
+                    logger.info("❌ EMAs in bearish alignment (9 < 21)")
+                    return False
+                
+                # Keep existing volatility and MACD checks
+                if bb_width > 0.5:
+                    logger.info(f"❌ BB Width too high: {bb_width:.3f}")
+                    return False
+                
+                if (atr/current_price) > 0.04:
+                    logger.info(f"❌ ATR too high: {(atr/current_price)*100:.1f}%")
+                    return False
+                
+                # 5. MACD Momentum
+                macd = ta.MACD(df['close'])
+                if macd.macd().iloc[-1] < macd.macd_signal().iloc[-1]:
+                    logger.info("❌ MACD below signal line - Weak momentum")
+                    return False
+                
+                logger.info("\n✅ Regular asset entry conditions met:")
+                logger.info(f"- Daily timeframe confirmation")
+                logger.info(f"- RSI and volume criteria met")
+                logger.info(f"- EMAs in bullish alignment")
+                logger.info(f"- Controlled volatility")
+                logger.info(f"- Strong momentum")
+            
+            # Final resistance check for both types
+            try:
+                if resistance_levels:
+                    nearest_resistance = min(r for r in resistance_levels if r > current_price)
+                    distance_to_resistance = (nearest_resistance - current_price) / current_price
+                    
+                    # If price is within 3% of resistance, reject entry
+                    if distance_to_resistance < 0.03:
+                        logger.info(f"❌ Too close to resistance: {distance_to_resistance*100:.1f}% away")
+                        return False
+                        
+                    logger.info(f"✅ Clear distance to resistance: {distance_to_resistance*100:.1f}%")
                 else:
-                    total_cost += size * price
-                    accumulated += size
-
-            if accumulated > 0:
-                exact_price = total_cost / accumulated
-                logger.info(f"Exact FIFO entry price: {exact_price:.6f} for {accumulated} {symbol}")
-                return exact_price
-
-            return mid_price
-
-        except Exception as e:
-            logger.error(f"FIFO price error {symbol}: {e}")
-            return mid_price
-
-    async def _price_position_checks(self, current_price: float, 
-                                    support_levels: List[float], 
-                                    resistance_levels: List[float]) -> bool:
-        """Validate price position relative to support levels for spot buying"""
-        try:
-            # Support zone check only for spot buying
-            near_support = False
-            if support_levels:
-                # Check against first 3 support levels with 2% tolerance
-                relevant_supports = sorted(support_levels)[:3]
-                near_support = any(abs(current_price - s)/current_price < 0.02 for s in relevant_supports)
-                logger.info(f"Support Check: Near {'✅' if near_support else '❌'}")
-                logger.info(f"Relevant Supports: {[round(s, 4) for s in relevant_supports]}")
-                logger.info(f"Current Price: {current_price:.4f}")
-
-            # Keep resistance check for logging purposes only
-            if resistance_levels:
-                nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
-                logger.info(f"Nearest Resistance: {nearest_resistance:.4f} (+2% buffer)")
-
-            logger.info(f"Price Position: {'✅ Near Support' if near_support else '❌ Not Near Support'}")
+                    logger.info("✅ No immediate resistance above")
+                    
+            except Exception as e:
+                logger.error(f"Error checking resistance: {e}")
+                return False
             
-            return near_support  # Only return support check for spot buying
+            logger.info(f"{'='*50}\n")
+            return True
             
         except Exception as e:
-            logger.error(f"Price position check error: {e}")
+            logger.error(f"Error validating entry conditions: {e}")
             return False
 
-    async def detect_bear_bounce(self, df: pd.DataFrame) -> bool:
-        """Identify potential counter-trend rallies in bear markets"""
+    async def check_all_positions(self) -> None:
+        """Debug helper to check all positions and balances"""
         try:
-            # Require 3+ red candles followed by green
-            last_3_closes = df['close'].iloc[-3:].values
-            direction_changes = np.diff(np.sign(np.diff(last_3_closes)))
-            bounce_signal = (direction_changes[-1] > 0) and (df['volume'].iloc[-1] > df['volume'].iloc[-2]*1.5)
+            balance = await self.exchange.fetch_balance()
             
-            # Add RSI confirmation
-            rsi = talib.RSI(df['close'], 14).iloc[-1]
-            return bounce_signal and (rsi < 35)
-        except Exception as e:
-            logger.error(f"Bounce detection error: {e}")
-            return False
-    
-    def is_weekend(self):
-        """Check if current time is weekend in Kraken's primary markets (UTC-7 to UTC+3)"""
-        try:
-            # Get current time in UTC
-            utc_now = datetime.now(timezone.utc)
-            
-            # Check major crypto market timezones
-            market_tz = [
-                pytz.timezone('America/Los_Angeles'),  # UTC-7/-8
-                pytz.timezone('Europe/London'),        # UTC+0/+1
-                pytz.timezone('Asia/Hong_Kong')        # UTC+8
-            ]
-            
-            # Check if any major market is in weekend
-            for tz in market_tz:
-                local_time = utc_now.astimezone(tz)
-                if local_time.weekday() >= 5:  # 5=Saturday, 6=Sunday
-                    return True
-            return False
-            
-        except Exception as e:
-            logger.error(f"Weekend check error: {e}")
-            return False
-    
-    async def refresh_grid_levels(self, symbol: str) -> None:
-        """Recalculate grid levels after trades"""
-        try:
-            logger.info(f"🔄 Refreshing grid levels for {symbol}")
-            
-            # Get updated market data
-            df = await self.get_historical_data(symbol)
-            if df is None or df.empty:
-                logger.warning(f"❌ No data for {symbol} refresh")
-                return
+            logger.info("\n=== CHECKING ALL SPOT POSITIONS ===")
+            for currency, amount in balance.items():
+                total = float(amount.get('total', 0))
+                free = float(amount.get('free', 0))
+                used = float(amount.get('used', 0))
                 
-            # Recalculate support/resistance
-            support_levels, resistance_levels = await self.calculate_support_resistance(df, symbol)
-            
-            # Update grid prices
-            current_price = df['close'].iloc[-1]
-            grid_prices = await self.calculate_hybrid_grids(
-                symbol, df, support_levels, resistance_levels
-            )
-            logger.info(f"Current price: {current_price} | Grid levels: {len(grid_prices)}")
+                if total > 0:
+                    logger.info(f"\nFound {currency}:")
+                    logger.info(f"Total: {total}")
+                    logger.info(f"Free: {free}")
+                    logger.info(f"Used: {used}")
+                    
+                    # Try to get recent orders for this asset
+                    try:
+                        symbol = f"{currency}/USD"
+                        orders = await self.exchange.fetch_open_orders(symbol, limit=3)
+                        if orders:
+                            logger.info(f"Recent orders for {symbol}:")
+                            for order in orders:
+                                logger.info(f"Order: {order['side']} {order['amount']} @ {order['price']}")
+                    except Exception as e:
+                        logger.info(f"Could not fetch orders for {currency}: {e}")
+                        
+            logger.info("=" * 50)
             
         except Exception as e:
-            logger.error(f"Grid refresh error: {e}")
+            logger.error(f"Error checking positions: {e}")
 
-    async def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
-        """Calculate recent volatility using multiple methods"""
+    async def quick_profit_check(self, symbol: str, position: Dict, current_price: float) -> bool:
+        """Fast profit check and TP execution without other overhead"""
         try:
-            # Calculate different volatility metrics
+            entry_price = float(position['info']['price'])
+            position_side = position['info'].get('side', 'long')
+            position_size = float(position['info'].get('size', 0))
+            is_spot = True  # For now we're forcing spot
             
-            # 1. Traditional volatility (standard deviation of returns)
-            returns = df['close'].pct_change()
-            trad_vol = returns.std() * np.sqrt(252) * 100  # Annualized and converted to percentage
+            # Quick profit calc
+            profit_pct = ((current_price - entry_price) / entry_price) * 100
             
-            # 2. True Range based volatility
-            high_low = df['high'] - df['low']
-            high_close = np.abs(df['high'] - df['close'].shift())
-            low_close = np.abs(df['low'] - df['close'].shift())
-            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            atr = tr.rolling(window).mean()
-            atr_vol = (atr.iloc[-1] / df['close'].iloc[-1]) * 100  # Convert to percentage
-            
-            # 3. Parkinson volatility (uses high-low range)
-            hl_vol = np.sqrt(1/(4*np.log(2)) * 
-                            ((np.log(df['high']/df['low'])**2)
-                             .rolling(window)
-                             .mean())) * np.sqrt(252) * 100
-            
-            # Combine volatility metrics with weights
-            combined_vol = (
-                0.4 * trad_vol +      # Traditional volatility (40% weight)
-                0.4 * atr_vol +       # ATR-based volatility (40% weight)
-                0.2 * hl_vol.iloc[-1] # Parkinson volatility (20% weight)
-            )
-            
-            logger.info(f"\nVolatility Analysis:")
-            logger.info(f"Traditional Vol: {trad_vol:.2f}%")
-            logger.info(f"ATR-based Vol: {atr_vol:.2f}%")
-            logger.info(f"Parkinson Vol: {hl_vol.iloc[-1]:.2f}%")
-            logger.info(f"Combined Vol: {combined_vol:.2f}%")
-            
-            return combined_vol
-
-        except Exception as e:
-            logger.error(f"Error calculating volatility: {e}")
-            return 2.0  # Return a default moderate volatility
-
-    def calculate_atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> float:
-        try:
-            atr = talib.ATR(high, low, close, period)
-            if pd.isna(atr.iloc[-1]) or atr.iloc[-1] <= 0:
-                # Fallback to recent price range
-                recent_range = high.rolling(period).max() - low.rolling(period).min()
-                return recent_range.iloc[-1] / close.iloc[-1]
-            return atr.iloc[-1]
-        except Exception as e:
-            logger.warning(f"ATR calculation failed: {e}")
-            return 0.01  # 1% default
-
-    def is_near_support(self, price: float, support_levels: List[float]) -> bool:
-        """Check if price is within 2% of a support level"""
-        if not support_levels:
+            # Check TP1 (5%)
+            if profit_pct >= 5.0:
+                tp_size = position_size * 0.3
+                await self.execute_take_profit(symbol, position_side, tp_size, current_price, "TP1", is_spot)
+                return True
+                
+            # Check TP2 (10%)
+            if profit_pct >= 10.0:
+                tp_size = position_size * 0.3
+                await self.execute_take_profit(symbol, position_side, tp_size, current_price, "TP2", is_spot)
+                return True
+                
             return False
-        
-        nearest_support = min(support_levels, key=lambda x: abs(x - price))
-        price_diff_pct = abs(price - nearest_support) / price  # Changed denominator
-        
-        # Allow 2% threshold for buy levels
-        is_near = price_diff_pct <= 0.02  # 2% threshold
-        
-        logger.info(f"Support check: {price} vs {nearest_support} ({price_diff_pct*100:.2f}%)")
-        return is_near
+            
+        except Exception as e:
+            logger.error(f"Error in quick profit check: {e}")
+            return False
+
+    async def get_available_balance(self) -> float:
+        """Get actual available balance accounting for open orders"""
+        try:
+            balance = await self.get_account_balance()
+            
+            # Get all open orders to calculate committed funds
+            open_orders = await self.exchange.fetch_open_orders()
+            committed_funds = sum(
+                float(order['price']) * float(order['amount'])
+                for order in open_orders
+                if order['side'] == 'buy'  # Only count buy orders
+            )
+            
+            actual_available = balance - committed_funds
+            logger.info(f"\nBalance Analysis:")
+            logger.info(f"Total Balance: ${balance:.2f}")
+            logger.info(f"Committed in Orders: ${committed_funds:.2f}")
+            logger.info(f"Actually Available: ${actual_available:.2f}")
+            
+            # Update sufficient funds flag
+            self.has_sufficient_funds = actual_available > 20  # Minimum $20 available
+            
+            return actual_available
+            
+        except Exception as e:
+            logger.error(f"Error calculating available balance: {e}")
+            return 0.0
 
 if __name__ == "__main__":
     try:
@@ -4705,7 +4029,6 @@ if __name__ == "__main__":
         
         # Initialize strategy
         strategy = KrakenAdvancedGridStrategy(demo_mode=False)
-        strategy.is_spot = True  # Force spot mode
         
         # Run with proper error handling
         loop = asyncio.get_event_loop()
