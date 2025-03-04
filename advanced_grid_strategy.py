@@ -440,6 +440,13 @@ class KrakenAdvancedGridStrategy:
                     tasks = []
                     last_row = df.iloc[-1]
                     technical_data = {
+                        'timeframe': '5m',  # Since df is the 5-minute dataframe
+                        'price_data': {
+                            'open': df['open'].tolist(),
+                            'high': df['high'].tolist(),
+                            'low': df['low'].tolist(),
+                            'close': df['close'].tolist()
+                        },
                         'technical': {
                             'indicators': {
                                 'rsi': last_row['rsi'],
@@ -2638,7 +2645,7 @@ class KrakenAdvancedGridStrategy:
             return False
 
     async def calculate_hybrid_grids(self, symbol: str, df: pd.DataFrame, support_levels: List[float], resistance_levels: List[float]) -> List[float]:
-        """Calculate grid levels using multiple methods with confidence scoring"""
+        """Calculate grid levels focusing exclusively on support levels for buy orders"""
         try:
             # Validate dataframe and price
             if df.empty or df['close'].iloc[-1] == 0:
@@ -2698,7 +2705,6 @@ class KrakenAdvancedGridStrategy:
             self.adjust_grid_spacing_for_fees(current_price)
             avg_position_size = await self.calculate_position_size(current_price, symbol)
             
-            # Guard against zero position size
             if avg_position_size <= 0:
                 logger.error(f"Invalid position size for {symbol}")
                 return []
@@ -2706,82 +2712,51 @@ class KrakenAdvancedGridStrategy:
             total_fees = self.calculate_total_fees(current_price, avg_position_size, symbol)
             min_profit_needed = total_fees * 2
 
-            logger.info(f"\nGrid Profitability Analysis for {symbol}:")
-            logger.info(f"Min Profit Needed: ${min_profit_needed:.4f}")
-            logger.info(f"Current Grid Spacing: {self.grid_spacing*100:.2f}%")
-            logger.info(f"Estimated Profit per Grid: ${(current_price * self.grid_spacing * avg_position_size):.4f}")
-
-            # Volume profile analysis with S/R and Technical boost
-            try:
-                price_bins = pd.qcut(df['close'], q=10, duplicates='drop')
-                volume_profile = df.groupby(price_bins, observed=True)['volume'].sum()
-                high_volume_levels = volume_profile[volume_profile > volume_profile.mean()].index
+            # Filter support levels below current price
+            valid_support_levels = [level for level in support_levels if level < current_price]
+            
+            levels_with_confidence = {}
+            
+            # Analyze each support level
+            for support_level in valid_support_levels:
+                # Skip if support is too far from current price (>10%)
+                if abs(support_level - current_price) / current_price > 0.10:
+                    continue
                 
-                for level in high_volume_levels:
-                    price = round(level.mid, 2)
-                    base_conf = 0.3
-                    sr_boost = self.get_sr_boost(price, support_levels, resistance_levels)
-                    tech_boost = self.calculate_technical_boost(price, tech_scores)
-                    levels_with_confidence[price] = levels_with_confidence.get(price, 0) + base_conf + sr_boost + tech_boost
-            except Exception as e:
-                logger.error(f"Error in volume profile calculation: {e}")
-
-            # Moving Averages with S/R and Technical boost
-            try:
-                ma_periods = [20, 50, 100, 200]
-                for period in ma_periods:
-                    ma = df['close'].rolling(period).mean().iloc[-1]
-                    if abs(ma - current_price) / current_price <= 0.10:
-                        price = round(ma, 2)
-                        base_conf = 0.2
-                        sr_boost = self.get_sr_boost(price, support_levels, resistance_levels)
-                        tech_boost = self.calculate_technical_boost(price, tech_scores)
-                        levels_with_confidence[price] = levels_with_confidence.get(price, 0) + base_conf + sr_boost + tech_boost
-            except Exception as e:
-                logger.error(f"Error in MA calculation: {e}")
-
-            # Market Structure with S/R boost
-            try:
-                window = 5
-                for i in range(window, len(df) - window):
-                    if (df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max() and 
-                        df['volume'].iloc[i] > df['volume'].iloc[i-window:i+window+1].mean()):
-                        price = round(df['high'].iloc[i], 2)
-                        base_conf = 0.3
-                        sr_boost = self.get_sr_boost(price, support_levels, resistance_levels)  # Fixed function call
-                        levels_with_confidence[price] = levels_with_confidence.get(price, 0) + base_conf + sr_boost
-                    
-                    if (df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min() and 
-                        df['volume'].iloc[i] > df['volume'].iloc[i-window:i+window+1].mean()):
-                        price = round(df['low'].iloc[i], 2)
-                        base_conf = 0.3
-                        sr_boost = self.get_sr_boost(price, support_levels, resistance_levels)  # Fixed function call
-                        levels_with_confidence[price] = levels_with_confidence.get(price, 0) + base_conf + sr_boost
-            except Exception as e:
-                logger.error(f"Error in market structure calculation: {e}")
-
-            # Recent Price Action with S/R boost
-            try:
-                recent_df = df.tail(50)
-                price_clusters = pd.qcut(recent_df['close'], q=5, duplicates='drop')
-                recent_levels = price_clusters.value_counts().index
+                # Calculate confidence score for support level
+                base_conf = 0.5  # Higher base confidence for support levels
                 
-                for level in recent_levels:
-                    price = round(level.mid, 2)
-                    base_conf = 0.2
-                    sr_boost = self.get_sr_boost(price, support_levels, resistance_levels)  # Fixed function call
-                    levels_with_confidence[price] = levels_with_confidence.get(price, 0) + base_conf + sr_boost
-            except Exception as e:
-                logger.error(f"Error in recent price action calculation: {e}")
+                # Add volume profile boost
+                try:
+                    price_bins = pd.qcut(df['close'], q=10, duplicates='drop')
+                    volume_profile = df.groupby(price_bins, observed=True)['volume'].sum()
+                    if any(abs(support_level - level.mid) / level.mid < 0.01 for level in volume_profile.index):
+                        base_conf += 0.2
+                except Exception as e:
+                    logger.debug(f"Volume profile calculation skipped: {e}")
 
-            # Filter and sort levels (keep your existing logic)
-            min_confidence = 0.3
+                # Add technical boost
+                tech_boost = self.calculate_technical_boost(support_level, {
+                    '1h': {
+                        'rsi': df['rsi'].iloc[-1],
+                        'macd_hist': df['macd'].iloc[-1],
+                        'prev_macd_hist': df['macd'].iloc[-2] if len(df) > 2 else 0,
+                        'ema_alignment': True,
+                        'is_bullish': df['rsi'].iloc[-1] < 40
+                    }
+                })
+                
+                final_confidence = base_conf + tech_boost
+                levels_with_confidence[support_level] = final_confidence
+
+            # Filter and sort levels
+            min_confidence = 0.4  # Higher minimum confidence
             valid_levels = {
                 price: conf for price, conf in levels_with_confidence.items()
-                if conf >= min_confidence and abs(price - current_price) / current_price <= 0.10
+                if conf >= min_confidence
             }
 
-            # Minimum spacing and filtering (keep your existing logic)
+            # Ensure minimum spacing between levels
             min_distance = max(current_price * 0.02, min_profit_needed / (current_price * avg_position_size))
             filtered_levels = []
             
@@ -2789,21 +2764,15 @@ class KrakenAdvancedGridStrategy:
                 if not filtered_levels or abs(price - filtered_levels[-1]) >= min_distance:
                     filtered_levels.append(price)
 
-            # Add current price if not too close
-            if all(abs(current_price - level) >= min_distance for level in filtered_levels):
-                filtered_levels.append(current_price)
-                filtered_levels.sort()
-
             # Log results
-            logger.info(f"\nGrid levels for {symbol}:")
+            logger.info(f"\nBuy Grid levels for {symbol} (Support-based):")
             logger.info(f"Current price: {current_price}")
             for level in filtered_levels:
                 confidence = valid_levels.get(level, 'current')
-                logger.info(f"Level: {level}, Confidence: {confidence if confidence != 'current' else 'Current Price'}")
+                logger.info(f"Support Buy Level: {level}, Confidence: {confidence}")
 
-            logger.info(f"\nSupport and Resistance Analysis for {symbol}:")
-            logger.info(f"Support levels: {[round(s, 4) for s in support_levels]}")
-            logger.info(f"Resistance levels: {[round(r, 4) for r in resistance_levels]}")
+            logger.info(f"\nSupport Level Analysis for {symbol}:")
+            logger.info(f"Valid support levels below current price: {[round(s, 4) for s in valid_support_levels]}")
             logger.info(f"Current price: {current_price}")
 
             return filtered_levels
