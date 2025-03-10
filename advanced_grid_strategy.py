@@ -1781,13 +1781,44 @@ class KrakenAdvancedGridStrategy:
                     # Only execute if actually in loss
                     if current_price < entry_price:
                         logger.info("Confirming actual loss before stop")
-                        await self.execute_stop_loss(
-                            symbol=symbol,
-                            position_size=position_size,
-                            is_spot=is_spot,
-                            reason="stop loss"
-                        )
-                        return  # Add return here to handle the stop execution
+                        
+                        # Get minimum volume requirements
+                        min_volumes = {
+                            'XBT': 0.0001,  # Bitcoin
+                            'ETH': 0.01,    # Ethereum
+                            'SOL': 0.1,     # Solana
+                            'XRP': 30.0,    # Ripple minimum
+                            'default': 5.0   # Default minimum
+                        }
+                        
+                        # Get asset and its minimum volume
+                        asset = symbol.split('/')[0]
+                        min_volume = min_volumes.get(asset, min_volumes['default'])
+                        
+                        # Get actual balance
+                        try:
+                            balance = await self.exchange.fetch_balance()
+                            actual_balance = float(balance.get(asset, {}).get('free', 0))
+                            logger.info(f"Actual {asset} balance: {actual_balance}")
+                            logger.info(f"Minimum volume required: {min_volume}")
+                            
+                            # Take full position if our balance is less than minimum requirement
+                            if actual_balance < min_volume:
+                                logger.info(f"Balance {actual_balance} below minimum {min_volume}, taking full position")
+                                position_size = actual_balance
+                            
+                            # Execute the stop loss with updated size
+                            await self.execute_stop_loss(
+                                symbol=symbol,
+                                position_size=position_size,
+                                is_spot=is_spot,
+                                reason="stop loss"
+                            )
+                            return
+                            
+                        except Exception as e:
+                            logger.error(f"Error checking balance for minimum volume: {e}")
+                            return
                     else:
                         logger.info("Position in profit, skipping stop loss")
                         return
