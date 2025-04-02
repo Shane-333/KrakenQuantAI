@@ -726,23 +726,29 @@ class KrakenAdvancedGridStrategy:
     async def check_existing_orders(self, symbol: str) -> bool:
         """Check if there are already grid orders placed for this symbol"""
         try:
-            # Fetch all open orders for the symbol
-            open_orders = await self.exchange.fetch_closed_orders(symbol)
+            # Fetch only open orders for the symbol
+            open_orders = await self.exchange.fetch_open_orders(symbol)
             
             if open_orders:
-                # Remove duplicates using set
-                order_prices = sorted(set(order['price'] for order in open_orders))
+                # Remove duplicates using set and ensure proper float conversion
+                order_prices = sorted(set(float(order['price']) for order in open_orders))
                 
-                # Count orders on each side of current price
+                # Get current price for comparison
                 current_price = await self.get_current_price(symbol)
-                buy_orders = len([p for p in order_prices if p < current_price])
-                sell_orders = len([p for p in order_prices if p > current_price])
-                
-                logger.info(f"Found existing grid orders for {symbol} - "
-                           f"Buy orders: {buy_orders}, Sell orders: {sell_orders}, "
-                           f"Prices: {order_prices}")
-                return True
-                
+                if current_price:
+                    # Count orders on each side of current price
+                    buy_orders = len([p for p in order_prices if p < current_price])
+                    sell_orders = len([p for p in order_prices if p > current_price])
+                    
+                    logger.info(f"\nExisting Grid Orders for {symbol}:")
+                    logger.info(f"Current Price: ${current_price:.4f}")
+                    logger.info(f"Buy Orders: {buy_orders}")
+                    logger.info(f"Sell Orders: {sell_orders}")
+                    logger.info(f"Grid Prices: {[f'${p:.4f}' for p in order_prices]}")
+                    
+                    return True
+                    
+            logger.info(f"No open grid orders found for {symbol}")
             return False
             
         except Exception as e:
