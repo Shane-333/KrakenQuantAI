@@ -130,6 +130,9 @@ class KrakenAdvancedGridStrategy:
         self.slippage_buffer = 0.001  # 0.1% slippage buffer
         self.volatility_buffer = 0.002  # 0.2% volatility buffer
         
+        # Add stale order timeout parameter
+        self.stale_order_timeout_hours = 24  # Default timeout for stale orders (24 hours)
+        
         # Initialize exchange and price tracking
         self.initialize_exchange()
 
@@ -747,7 +750,8 @@ class KrakenAdvancedGridStrategy:
                     logger.info(f"Grid Prices: {[f'${p:.4f}' for p in order_prices]}")
                     
                     return True
-                    
+            
+            # This code was unreachable due to incorrect indentation
             logger.info(f"No open grid orders found for {symbol}")
             return False
             
@@ -1928,33 +1932,59 @@ class KrakenAdvancedGridStrategy:
                 logger.info(f"Entry: {entry_price}")
                 logger.info(f"Current: {current_price}")
                 logger.info(f"P&L: {profit_pct:.2f}%")
-                logger.info(f"TP Size: {tp_size}")
                 
                 try:
+                    # Get minimum volume requirements
+                    min_volumes = {
+                        'XBT': 0.0001,  # Bitcoin
+                        'ETH': 0.01,    # Ethereum
+                        'SOL': 0.1,     # Solana
+                        'XRP': 30.0,    # Ripple minimum
+                        'SPX': 5.0,     # SPX minimum
+                        'default': 5.0   # Default minimum
+                    }
+                    
+                    # Get asset and its minimum volume
+                    asset = symbol.split('/')[0]
+                    min_volume = min_volumes.get(asset, min_volumes['default'])
+                    
+                    # Get actual balance
+                    balance = await self.exchange.fetch_balance()
+                    actual_balance = float(balance.get(asset, {}).get('free', 0))
+                    logger.info(f"Current balance: {actual_balance} {asset}")
+                    logger.info(f"Minimum volume required: {min_volume}")
+                    
                     # Calculate TP2 size (30% of original position)
                     tp_size = round(position_size * 0.30, 8)  # 30% for TP2
-                    logger.info(f"TP2 Size: {tp_size}")
+                    logger.info(f"Calculated TP2 size: {tp_size}")
                     
-                    # Execute TP2
-                    tp_executed = await self.execute_take_profit(
-                        symbol=symbol,
-                        position_side=position_side,
-                        size=tp_size,
-                        price=current_price,
-                        tp_type="TP2",
-                        is_spot=is_spot
-                    )
+                    # If either TP size or remaining balance is below minimum, take full position
+                    if tp_size < min_volume or actual_balance < min_volume:
+                        logger.info(f"Position/TP size below minimum {min_volume}, taking full position")
+                        tp_size = actual_balance
                     
-                    if tp_executed:
-                        position_data['tp2_triggered'] = True
-                        position_data['trailing_active'] = True
-                        if tp_size == position_data['current_position_size']:  # If we took all remaining
-                            position_data['current_position_size'] = 0
+                    # Execute TP2 only if we have enough to meet minimum
+                    if tp_size >= min_volume:
+                        logger.info(f"Executing TP2 with size: {tp_size}")
+                        tp_executed = await self.execute_take_profit(
+                            symbol=symbol,
+                            position_side=position_side,
+                            size=tp_size,
+                            price=current_price,
+                            tp_type="TP2",
+                            is_spot=is_spot
+                        )
+                        
+                        if tp_executed:
+                            position_data['tp2_triggered'] = True
+                            position_data['trailing_active'] = True
+                            position_data['current_position_size'] = actual_balance - tp_size
+                            logger.info(f"✅ TP2 executed successfully")
+                            logger.info(f"Remaining position size: {position_data['current_position_size']}")
                         else:
-                            position_data['current_position_size'] = position_size * 0.40  # Track remaining 40%
-                        logger.info(f"✅ TP2 executed successfully")
+                            logger.error(f"❌ Failed to execute TP2")
                     else:
-                        logger.error(f"❌ Failed to execute TP2")
+                        logger.warning(f"Cannot execute TP2 - Position size {tp_size} below minimum {min_volume}")
                         
                 except Exception as e:
                     logger.error(f"Error executing TP2: {e}")
@@ -2240,6 +2270,9 @@ class KrakenAdvancedGridStrategy:
                     # Get mapped symbol from class attribute
                     mapped_symbol = self.symbol_map.get(symbol)
                     logger.info(f"Checking position for {symbol} (mapped: {mapped_symbol})")
+                    
+                    # First check and cancel any stale orders (older than 24 hours)
+                    await self.cancel_stale_orders(symbol)  # Use class parameter by default
                     
                     # Check both mapped and original symbol
                     position = None
@@ -2546,6 +2579,16 @@ class KrakenAdvancedGridStrategy:
                     # Only track symbols with active positions
                     self.active_symbols = list(self.active_positions.keys())
                     logger.info(f"Insufficient funds - Only monitoring active positions: {self.active_symbols}")
+                
+                # Check for and cancel stale orders across all active symbols
+                logger.info("Checking for stale orders across all active symbols...")
+                for symbol in self.active_symbols:
+                    try:
+                        await self.cancel_stale_orders(symbol)  # Use class parameter by default
+                        # Brief pause between API calls to avoid rate limits
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.error(f"Error checking stale orders for {symbol}: {e}")
                 
                 await asyncio.sleep(3600)  # Scan every hour
                 
@@ -4023,6 +4066,46 @@ class KrakenAdvancedGridStrategy:
         except Exception as e:
             logger.error(f"Error calculating available balance: {e}")
             return 0.0
+
+    async def cancel_stale_orders(self, symbol: str, max_age_hours: int = None) -> None:
+        """Cancel orders that have been open for longer than the specified time period"""
+        try:
+            # Use the class parameter if no specific timeout is provided
+            if max_age_hours is None:
+                max_age_hours = self.stale_order_timeout_hours
+
+            # Fetch open orders for the symbol
+            open_orders = await self.exchange.fetch_open_orders(symbol)
+            
+            if not open_orders:
+                return
+                
+            current_time = time.time() * 1000  # Current time in milliseconds
+            cancelled_count = 0
+            
+            for order in open_orders:
+                # Calculate order age in hours
+                order_time = order['timestamp']  # Order creation time in milliseconds
+                order_age_hours = (current_time - order_time) / (1000 * 60 * 60)
+                
+                # Cancel orders older than max_age_hours
+                if order_age_hours > max_age_hours:
+                    order_id = order['id']
+                    price = float(order['price'])
+                    side = order['side']
+                    
+                    try:
+                        await self.exchange.cancel_order(order_id, symbol)
+                        cancelled_count += 1
+                        logger.info(f"Cancelled stale {side} order for {symbol} at price ${price:.4f} (age: {order_age_hours:.1f} hours)")
+                    except Exception as e:
+                        logger.error(f"Failed to cancel stale order {order_id} for {symbol}: {e}")
+            
+            if cancelled_count > 0:
+                logger.info(f"Cancelled {cancelled_count} stale orders for {symbol} older than {max_age_hours} hours")
+        
+        except Exception as e:
+            logger.error(f"Error cancelling stale orders for {symbol}: {e}")
 
 if __name__ == "__main__":
     try:
