@@ -1071,8 +1071,59 @@ class KrakenAdvancedGridStrategy:
             return False
 
     async def execute_grid_orders(self, symbol: str, force_create: bool = False) -> None:
-        """Execute grid orders with fee validation"""
+        """Execute grid orders with minimum volume validation"""
         try:
+            # Get current price and calculate position size
+            current_price = await self.get_current_price(symbol)
+            position_size = await self.calculate_position_size(current_price, symbol)
+            
+            # Exchange minimum volume requirements
+            min_volumes = {
+                'CRV/USD': 5.0,
+                'XLM/USD': 30.0,
+                'DOGE/USD': 50.0,
+                'MATIC/USD': 10.0,
+                'SOL/USD': 0.1,
+                'ETH/USD': 0.02,
+                'BTC/USD': 0.0001,
+                'AVAX/USD': 0.1,
+                'DOT/USD': 1.0,
+                'ADA/USD': 5.0,  # Updated ADA minimum
+                'LINK/USD': 1.0,
+                'ATOM/USD': 0.1,
+                'FIL/USD': 0.1,
+                'UNI/USD': 1.0,
+                'AAVE/USD': 0.01,
+                'LTC/USD': 0.1,
+                'OP/USD': 1.0,
+                'APE/USD': 1.0,
+                'NEAR/USD': 1.0,
+                'FTM/USD': 10.0
+            }
+            
+            # Get minimum volume for this symbol
+            min_volume = min_volumes.get(symbol, 5.0)  # Default to 5.0 if not specified
+            
+            # Check if position size meets minimum
+            if position_size < min_volume:
+                logger.warning(f"❌ Calculated position size {position_size} is below minimum {min_volume} for {symbol}")
+                logger.warning(f"Skipping grid creation to prevent locked positions")
+                return
+            
+            # Calculate grid levels
+            grid_levels = await self.calculate_grid_levels(current_price, symbol)
+            
+            # Validate each grid level meets minimum
+            for level in grid_levels:
+                level_size = position_size / len(grid_levels)  # Size per grid level
+                if level_size < min_volume:
+                    logger.warning(f"❌ Grid level size {level_size} is below minimum {min_volume} for {symbol}")
+                    logger.warning(f"Skipping grid creation to prevent locked positions")
+                    return
+            
+            # If we get here, all sizes meet minimum requirements
+            logger.info(f"✅ All order sizes meet minimum volume requirements for {symbol}")
+            
             logger.info(f"\n{'='*50}")
             logger.info(f"🔄 STARTING GRID EXECUTION FOR {symbol}")
             
